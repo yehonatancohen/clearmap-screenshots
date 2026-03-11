@@ -1,0 +1,8 @@
+screenshots/
+__pycache__/
+*.pyc
+config.env
+serviceAccountKey.json
+.env
+venv/
+.venv/
