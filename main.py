@@ -232,6 +232,9 @@ def _build_caption(alerts_data: dict) -> str:
     for _key, alert in alerts_data.items():
         if not isinstance(alert, dict):
             continue
+        # Skip test alerts
+        if alert.get("is_test") or alert.get("test") or alert.get("isTest"):
+            continue
         status = alert.get("status", "alert")
         city_he = alert.get("city_name_he", "")
         ts = alert.get("timestamp", 0) / 1000  # JS ms → Python seconds
@@ -355,6 +358,9 @@ def main():
         if isinstance(data, dict):
             for key, alert in data.items():
                 if isinstance(alert, dict) and _is_primary_alert(alert.get("status", "")):
+                    # Skip test alerts
+                    if alert.get("is_test") or alert.get("test") or alert.get("isTest"):
+                        continue
                     current_primary_ids.add(key)
 
         new_primaries = current_primary_ids - previous_primary_ids
@@ -388,8 +394,19 @@ def main():
                             current_data = dict(latest_snapshot)
 
                         if current_data:
+                            # Filter out test alerts to see if there's anything real to show
+                            real_alerts = {
+                                k: v for k, v in current_data.items()
+                                if isinstance(v, dict) and not (v.get("is_test") or v.get("test") or v.get("isTest"))
+                            }
+
+                            if not real_alerts:
+                                log.info("📸 No non-test alerts active — skipping screenshot.")
+                                pending_screenshot = False
+                                continue
+
                             log.info("📸 Cooldown & batch window elapsed — capturing screenshot for %d alerts",
-                                     len(current_data))
+                                     len(real_alerts))
                             try:
                                 final_path = OUTPUT_DIR / "broadcast_latest.png"
                                 capture_screenshot(SCREENSHOT_URL, final_path)

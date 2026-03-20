@@ -88,6 +88,9 @@ def fetch_active_statuses() -> tuple[set[str], dict[str, int]]:
         counts: dict[str, int] = {}
         for v in data.values():
             if isinstance(v, dict):
+                # Skip test alerts
+                if v.get("is_test") or v.get("test") or v.get("isTest"):
+                    continue
                 s = v.get("status", "alert")
                 counts[s] = counts.get(s, 0) + 1
         return set(counts.keys()), counts
