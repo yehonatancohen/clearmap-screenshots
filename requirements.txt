@@ -3,3 +3,4 @@ requests
 playwright
 Pillow
 python-bidi
+pyTelegramBotAPI

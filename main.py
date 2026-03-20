@@ -28,6 +28,7 @@ from pathlib import Path
 
 import firebase_admin
 import requests
+import telebot
 from firebase_admin import credentials, db
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -56,6 +57,7 @@ SCREENSHOT_COOLDOWN = int(os.environ.get("SCREENSHOT_COOLDOWN", "") or _cfg.get(
 BATCH_DELAY = int(os.environ.get("SCREENSHOT_BATCH_DELAY", "") or _cfg.get("SCREENSHOT_BATCH_DELAY", "10"))
 FIREBASE_DB_URL = "https://clear-map-f20d0-default-rtdb.europe-west1.firebasedatabase.app/"
 FIREBASE_NODE = "/public_state/active_alerts"
+FIREBASE_SUBSCRIBERS = "/public_state/subscribers"
 
 VIEWPORT_SIZE = 900
 OUTPUT_DIR = Path(__file__).parent / "screenshots"
@@ -291,27 +293,104 @@ def _build_caption(alerts_data: dict) -> str:
     return caption
 
 
+# ── Telegram Subscriber Management ──────────────────────────────────────────
+
+def get_subscribers() -> list[str]:
+    """Fetch the list of subscriber chat IDs from Firebase."""
+    try:
+        ref = db.reference(FIREBASE_SUBSCRIBERS)
+        subs = ref.get()
+        if isinstance(subs, dict):
+            return [str(chat_id) for chat_id in subs.keys()]
+        return []
+    except Exception as e:
+        log.error("Failed to fetch subscribers: %s", e)
+        return []
+
+
+def add_subscriber(chat_id: int, chat_title: str = ""):
+    """Save a new chat_id to the Firebase subscribers list."""
+    try:
+        ref = db.reference(f"{FIREBASE_SUBSCRIBERS}/{chat_id}")
+        ref.set({
+            "added_at": int(time.time()),
+            "title": chat_title
+        })
+        log.info("👤 New subscriber added: %s (%s)", chat_id, chat_title)
+    except Exception as e:
+        log.error("Failed to add subscriber %s: %s", chat_id, e)
+
+
+def remove_subscriber(chat_id: str):
+    """Remove a chat_id from the Firebase subscribers list."""
+    try:
+        ref = db.reference(f"{FIREBASE_SUBSCRIBERS}/{chat_id}")
+        ref.delete()
+        log.info("👤 Subscriber removed: %s", chat_id)
+    except Exception as e:
+        log.error("Failed to remove subscriber %s: %s", chat_id, e)
+
+
+def telegram_listener():
+    """Background thread to listen for /start or /register commands."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+    @bot.message_handler(commands=['start', 'register'])
+    def handle_register(message):
+        chat_id = message.chat.id
+        chat_title = message.chat.title or message.chat.username or "Private"
+        add_subscriber(chat_id, chat_title)
+        try:
+            bot.reply_to(message, "✅ המערכת נרשמה בהצלחה! התרעות יישלחו לערוץ זה.")
+        except Exception:
+            pass
+
+    log.info("👂 Telegram command listener started (polling)...")
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=3, timeout=20)
+        except Exception as e:
+            log.error("Telegram polling error: %s", e)
+            time.sleep(10)
+
+
 # ── Telegram Sender ─────────────────────────────────────────────────────────
 
-def send_photo_to_channel(photo_path: Path, caption: str) -> bool:
-    """Send a photo to the Telegram channel."""
-    try:
-        with open(photo_path, "rb") as f:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption},
-                files={"photo": ("alert.png", f, "image/png")},
-                timeout=30,
-            )
-        if resp.ok:
-            log.info("📸 Broadcast sent to channel %s", TELEGRAM_CHANNEL_ID)
-            return True
-        else:
-            log.error("📸 sendPhoto failed: %s", resp.text[:200])
-            return False
-    except Exception as e:
-        log.error("📸 sendPhoto error: %s", e)
-        return False
+def broadcast_to_subscribers(photo_path: Path, caption: str):
+    """Send the alert photo to all registered subscribers."""
+    subscribers = get_subscribers()
+    
+    # Also include the legacy/default channel if it's not in the list
+    if TELEGRAM_CHANNEL_ID and TELEGRAM_CHANNEL_ID not in subscribers:
+        subscribers.append(TELEGRAM_CHANNEL_ID)
+
+    if not subscribers:
+        log.warning("📸 No subscribers found for broadcast!")
+        return
+
+    log.info("📸 Broadcasting to %d subscribers...", len(subscribers))
+    
+    for chat_id in subscribers:
+        try:
+            with open(photo_path, "rb") as f:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                    data={"chat_id": chat_id, "caption": caption},
+                    files={"photo": ("alert.png", f, "image/png")},
+                    timeout=30,
+                )
+            if resp.ok:
+                log.info("   ✅ Sent to %s", chat_id)
+            elif resp.status_code == 403:
+                log.warning("   ❌ Forbidden (bot kicked) from %s — removing subscriber", chat_id)
+                remove_subscriber(chat_id)
+            else:
+                log.error("   ❌ Failed for %s: %s", chat_id, resp.text[:100])
+        except Exception as e:
+            log.error("   ❌ Error sending to %s: %s", chat_id, e)
 
 
 # ── Alert Change Detection (Firebase Listener) ─────────────────────────────
@@ -378,8 +457,11 @@ def main():
     ref = db.reference(FIREBASE_NODE)
     ref.listen(on_alerts_change)
 
-    log.info("📸 Broadcast config: channel=%s cooldown=%ds batch_delay=%ds",
-             TELEGRAM_CHANNEL_ID, SCREENSHOT_COOLDOWN, BATCH_DELAY)
+    # Start Telegram command listener
+    threading.Thread(target=telegram_listener, daemon=True).start()
+
+    log.info("📸 Broadcast config: cooldown=%ds batch_delay=%ds",
+             SCREENSHOT_COOLDOWN, BATCH_DELAY)
 
     # Main loop — handles batching and cooldown
     while True:
@@ -412,7 +494,7 @@ def main():
                                 capture_screenshot(SCREENSHOT_URL, final_path)
                                 caption = _build_caption(current_data)
                                 log.info("📸 Caption: %s", caption)
-                                send_photo_to_channel(final_path, caption)
+                                broadcast_to_subscribers(final_path, caption)
                                 last_screenshot_time = time.time()
                             except Exception as e:
                                 log.error("📸 Screenshot/broadcast failed: %s", e)
