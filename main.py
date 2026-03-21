@@ -348,6 +348,15 @@ def telegram_listener():
         except Exception:
             pass
 
+    @bot.message_handler(commands=['stop', 'unsubscribe'])
+    def handle_unregister(message):
+        chat_id = str(message.chat.id)
+        remove_subscriber(chat_id)
+        try:
+            bot.reply_to(message, "🛑 המערכת הוסרה בהצלחה. לא יישלחו יותר התרעות לערוץ זה.")
+        except Exception:
+            pass
+
     log.info("👂 Telegram command listener started (polling)...")
     while True:
         try:
