@@ -52,7 +52,7 @@ _cfg = _load_config_env()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("CLEARMAP_BOT_TOKEN", "") or _cfg.get("CLEARMAP_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "") or _cfg.get("TELEGRAM_CHANNEL_ID", "-1003879479829")
-SCREENSHOT_URL = os.environ.get("SCREENSHOT_URL", "") or _cfg.get("SCREENSHOT_URL", "https://clearmap.co.il")
+SCREENSHOT_URL = os.environ.get("SCREENSHOT_URL", "") or _cfg.get("SCREENSHOT_URL", "https://www.clearmap.co.il/broadcast?uav=true&ellipse=true")
 SCREENSHOT_COOLDOWN = int(os.environ.get("SCREENSHOT_COOLDOWN", "") or _cfg.get("SCREENSHOT_COOLDOWN", "120"))
 BATCH_DELAY = int(os.environ.get("SCREENSHOT_BATCH_DELAY", "") or _cfg.get("SCREENSHOT_BATCH_DELAY", "10"))
 FIREBASE_DB_URL = "https://clear-map-f20d0-default-rtdb.europe-west1.firebasedatabase.app/"
@@ -271,6 +271,7 @@ def _build_caption(alerts_data: dict) -> str:
                 lines.append(f"  • {city_name} ({t})")
 
     lines.append("")
+    lines.append("לצפייה במפה החיה ועדכונים בזמן אמת:")
     lines.append("🗺 clearmap.co.il")
 
     caption = "\n".join(lines)
@@ -288,7 +289,7 @@ def _build_caption(alerts_data: dict) -> str:
                 summary_parts.append(f"{emoji} {len(cities)} מקומות להישאר במרחב מוגן")
             else:
                 summary_parts.append(f"{emoji} {len(cities)} {label}")
-        caption = " | ".join(summary_parts) + "\n\n🗺 clearmap.co.il"
+        caption = " | ".join(summary_parts) + "\n\nלצפייה במפה החיה ועדכונים בזמן אמת:\n🗺 clearmap.co.il"
 
     return caption
 
