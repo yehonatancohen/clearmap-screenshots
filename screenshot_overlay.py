@@ -203,7 +203,8 @@ def draw_uav_disclaimer(img: Image.Image, theme: str) -> Image.Image:
     box_w = text_w + padding * 2
     box_h = text_h + padding * 2
 
-    lx = padding * 2
+    # Center at the top
+    lx = (w - box_w) // 2
     ly = padding * 2
 
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -227,7 +228,7 @@ def draw_uav_disclaimer(img: Image.Image, theme: str) -> Image.Image:
 
 
 def overlay_screenshot(raw_path: Path, output_path: Path, size: int = 1080,
-                       theme: str = "dark") -> Path:
+                       theme: str = "dark", custom_logo_path: Path | None = None) -> Path:
     """Full post-processing pipeline: crop, resize, logo, legend, disclaimer."""
     print(f"[+] Fetching active alert statuses...")
     active_statuses, status_counts = fetch_active_statuses()
@@ -247,7 +248,7 @@ def overlay_screenshot(raw_path: Path, output_path: Path, size: int = 1080,
     # Resize to target size
     img = img.resize((size, size), Image.LANCZOS)
 
-    # Overlay logo
+    # Overlay default logo (top-right)
     logo_path = LOGO_DIR / f"logo-{theme}-theme.png"
     if logo_path.exists():
         logo = Image.open(logo_path).convert("RGBA")
@@ -262,6 +263,26 @@ def overlay_screenshot(raw_path: Path, output_path: Path, size: int = 1080,
     else:
         print(f"  [warn] Logo not found: {logo_path}")
 
+    # Overlay custom logo (top-left) if provided
+    if custom_logo_path and custom_logo_path.exists():
+        try:
+            c_logo = Image.open(custom_logo_path).convert("RGBA")
+            # Limit width to 20% of image size
+            c_logo_w = int(size * 0.20)
+            c_logo_h = int(c_logo.height * (c_logo_w / c_logo.width))
+            # If height is too large, scale by height instead
+            if c_logo_h > int(size * 0.15):
+                c_logo_h = int(size * 0.15)
+                c_logo_w = int(c_logo.width * (c_logo_h / c_logo.height))
+
+            c_logo = c_logo.resize((c_logo_w, c_logo_h), Image.LANCZOS)
+
+            padding = int(size * 0.03)
+            img.paste(c_logo, (padding, padding), c_logo)
+            print(f"  [+] Overlayed custom logo: {custom_logo_path.name}")
+        except Exception as e:
+            print(f"  [warn] Could not overlay custom logo {custom_logo_path}: {e}")
+
     # Draw legend
     if active_statuses:
         img = draw_legend(img, active_statuses, theme, counts=status_counts)
@@ -272,3 +293,4 @@ def overlay_screenshot(raw_path: Path, output_path: Path, size: int = 1080,
     img = img.convert("RGB")
     img.save(str(output_path), "PNG", quality=95)
     return output_path
+

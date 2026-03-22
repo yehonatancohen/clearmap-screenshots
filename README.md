@@ -57,6 +57,27 @@ docker run -d \
   clearmap-screenshots
 ```
 
+## Custom Screenshots for Channels
+
+This service supports multiple Telegram channels with custom branding.
+
+1. **Register a Channel:**
+   Add the bot to your Telegram channel and ensure it has **Administrator** permissions. The bot will automatically detect the channel and add it to the broadcast list.
+
+2. **Manage Branding:**
+   Open a **private chat** with the bot and use the `/manage` command.
+   - You will see a list of channels where you are an admin and the bot is active.
+   - Select a channel to set or remove a custom logo.
+
+3. **Custom Logo Upload:**
+   - When setting a logo, the bot will ask you to upload a photo.
+   - It will generate a **preview** showing exactly how the logo will look on the map.
+   - You must **confirm** the preview before the logo is saved.
+   - Custom logos are placed in the **top-left corner**. The default ClearMap logo remains in the top-right.
+
+4. **UAV Disclaimer:**
+   If a custom logo is present, the UAV disclaimer (if active) will be centered at the top to avoid overlap.
+
 ## How it works
 
 1. Connects to Firebase and listens for changes to `public_state/active_alerts`

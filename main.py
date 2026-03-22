@@ -29,6 +29,8 @@ from pathlib import Path
 import firebase_admin
 import requests
 import telebot
+from telebot import types
+from PIL import Image
 from firebase_admin import credentials, db
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -110,8 +112,12 @@ def init_firebase():
 
 # ── Screenshot Capture ──────────────────────────────────────────────────────
 
-def capture_screenshot(url: str, output_path: Path, theme: str = "dark", size: int = 1080) -> Path:
-    """Capture a screenshot of the map using Playwright, overlay logo + legend."""
+def capture_screenshot(url: str, output_path: Path, theme: str = "dark", 
+                       size: int = 1080, custom_logo_path: Path | None = None) -> tuple[Path, Path]:
+    """
+    Capture a screenshot of the map using Playwright, overlay logo + legend.
+    Returns (final_output_path, raw_capture_path).
+    """
     from playwright.sync_api import sync_playwright
     from screenshot_overlay import overlay_screenshot
 
@@ -173,16 +179,16 @@ def capture_screenshot(url: str, output_path: Path, theme: str = "dark", size: i
                 """)
                 time.sleep(0.5)
 
-                raw_path = output_path.parent / "raw_capture.png"
+                raw_path = output_path.parent / f"raw_capture_{int(time.time())}.png"
                 page.screenshot(path=str(raw_path), full_page=False)
                 browser.close()
 
             # Overlay logo + legend using Pillow (lightweight, no browser needed)
-            overlay_screenshot(raw_path, output_path, size=size, theme=theme)
-            raw_path.unlink(missing_ok=True)
-
+            overlay_screenshot(raw_path, output_path, size=size, theme=theme, 
+                               custom_logo_path=custom_logo_path)
+            
             log.info("📸 Screenshot saved: %s (%.1f KB)", output_path, output_path.stat().st_size / 1024)
-            return output_path
+            return output_path, raw_path
 
         except Exception as e:
             log.error("📸 Attempt %d failed: %s", attempt, e)
@@ -197,6 +203,8 @@ def capture_screenshot(url: str, output_path: Path, theme: str = "dark", size: i
                 time.sleep(wait_secs)
             else:
                 raise RuntimeError(f"All {MAX_RETRIES} screenshot attempts failed") from e
+
+
 
 
 # ── Caption Builder ─────────────────────────────────────────────────────────
@@ -332,33 +340,273 @@ def remove_subscriber(chat_id: str):
         log.error("Failed to remove subscriber %s: %s", chat_id, e)
 
 
+# ── Telegram Subscriber Management ──────────────────────────────────────────
+
+def get_subscribers_data() -> dict:
+    """Fetch all subscriber data from Firebase."""
+    try:
+        ref = db.reference(FIREBASE_SUBSCRIBERS)
+        return ref.get() or {}
+    except Exception as e:
+        log.error("Failed to fetch subscribers: %s", e)
+        return {}
+
+def get_subscribers() -> list[str]:
+    """Fetch the list of subscriber chat IDs from Firebase."""
+    data = get_subscribers_data()
+    return [str(chat_id) for chat_id in data.keys()]
+
+
+def add_subscriber(chat_id: int, chat_title: str = ""):
+    """Save a new chat_id to the Firebase subscribers list."""
+    try:
+        ref = db.reference(f"{FIREBASE_SUBSCRIBERS}/{chat_id}")
+        ref.set({
+            "added_at": int(time.time()),
+            "title": chat_title
+        })
+        log.info("👤 New subscriber added: %s (%s)", chat_id, chat_title)
+    except Exception as e:
+        log.error("Failed to add subscriber %s: %s", chat_id, e)
+
+
+def remove_subscriber(chat_id: str):
+    """Remove a chat_id from the Firebase subscribers list."""
+    try:
+        ref = db.reference(f"{FIREBASE_SUBSCRIBERS}/{chat_id}")
+        ref.delete()
+        log.info("👤 Subscriber removed: %s", chat_id)
+    except Exception as e:
+        log.error("Failed to remove subscriber %s: %s", chat_id, e)
+
+
 def telegram_listener():
-    """Background thread to listen for /start or /register commands."""
+    """Background thread to manage bot interactions in private chats."""
     if not TELEGRAM_BOT_TOKEN:
         return
 
     bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+    
+    # user_id -> {"action": "waiting_for_logo", "channel_id": "..."}
+    user_states = {}
 
-    @bot.message_handler(commands=['start', 'register'])
-    def handle_register(message):
-        chat_id = message.chat.id
-        chat_title = message.chat.title or message.chat.username or "Private"
-        add_subscriber(chat_id, chat_title)
+    def is_user_admin(chat_id: str, user_id: int) -> bool:
+        """Check if user_id is an admin of chat_id."""
         try:
-            bot.reply_to(message, "✅ המערכת נרשמה בהצלחה! התרעות יישלחו לערוץ זה.")
+            member = bot.get_chat_member(chat_id, user_id)
+            return member.status in ("administrator", "creator")
         except Exception:
-            pass
+            return False
 
-    @bot.message_handler(commands=['stop', 'unsubscribe'])
-    def handle_unregister(message):
-        chat_id = str(message.chat.id)
-        remove_subscriber(chat_id)
+    @bot.message_handler(commands=['start', 'help', 'עזרה'], chat_types=['private'])
+    def handle_start(message):
+        text = (
+            "👋 *שלום! אני הבוט של ClearMap המיועד להפצת התרעות לערוצי טלגרם.* 🗺️\n\n"
+            "כדי להתחיל לעבוד איתי, בצע את השלבים הבאים:\n"
+            "1️⃣ **הוסף אותי לערוץ שלך** - הוסף את הבוט כמשתמש רגיל ולאחר מכן הגדר אותו כ**מנהל** (Administrator).\n"
+            "2️⃣ **נהל את ההגדרות כאן** - חזור לצ'אט הפרטי הזה ושלח את הפקודה /manage.\n\n"
+            "*מה אפשר לעשות כאן?*\n"
+            "✅ **ניהול ערוצים** - תמיכה בניהול של מספר ערוצים במקביל.\n"
+            "🖼️ **לוגו מותאם אישית** - העלאת לוגו שיופיע בפינה השמאלית העליונה של כל צילום מסך בערוץ שלך.\n"
+            "👁️ **תצוגה מקדימה** - תוכל לראות בדיוק איך הלוגו משתלב על המפה לפני האישור הסופי.\n"
+            "🗑️ **הסרת לוגו/ערוץ** - שליטה מלאה בהגדרות או הפסקת השירות לערוץ ספציפי.\n\n"
+            "*פקודות זמינות:*\n"
+            "/manage - בחירת ערוץ וניהול הלוגו\n"
+            "/help - הצגת הסבר זה שוב\n"
+            "/cancel - ביטול פעולה נוכחית (למשל בזמן העלאת לוגו)\n\n"
+            "לחץ על /manage כדי להתחיל!"
+        )
+        bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
+    @bot.message_handler(commands=['manage'], chat_types=['private'])
+    def handle_manage(message):
+        user_id = message.from_user.id
+        subs = get_subscribers_data()
+        
+        managed_channels = []
+        for chat_id, data in subs.items():
+            if is_user_admin(chat_id, user_id):
+                managed_channels.append((chat_id, data.get("title", chat_id)))
+        
+        if not managed_channels:
+            text = (
+                "❌ *לא נמצאו ערוצים בניהולך.*\n\n"
+                "וודא ש:\n"
+                "1. הוספת את הבוט לערוץ.\n"
+                "2. הגדרת את הבוט כ**מנהל** (Administrator) בערוץ.\n"
+                "3. אתה בעצמך מנהל בערוץ זה."
+            )
+            bot.send_message(message.chat.id, text, parse_mode="Markdown")
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        for cid, title in managed_channels:
+            markup.add(types.InlineKeyboardButton(f"📺 {title}", callback_data=f"manage_{cid}"))
+        
+        bot.send_message(message.chat.id, "👇 *בחר את הערוץ שברצונך לנהל:*", reply_markup=markup, parse_mode="Markdown")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("manage_"))
+    def callback_manage_channel(call):
+        channel_id = call.data.split("_")[1]
+        user_id = call.from_user.id
+        
+        if not is_user_admin(channel_id, user_id):
+            bot.answer_callback_query(call.id, "⚠️ אינך מנהל בערוץ זה יותר.", show_alert=True)
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🖼️ הגדרת לוגו חדש", callback_data=f"setlogo_{channel_id}"))
+        markup.add(types.InlineKeyboardButton("🗑️ הסרת לוגו קיים", callback_data=f"removelogo_{channel_id}"))
+        markup.add(types.InlineKeyboardButton("🚫 הפסקת התרעות לערוץ זה", callback_data=f"unregister_{channel_id}"))
+        markup.add(types.InlineKeyboardButton("🔙 חזרה לרשימה", callback_data="back_to_list"))
+        
+        bot.edit_message_text(f"⚙️ *ניהול הגדרות עבור הערוץ:*\n`{channel_id}`", 
+                             call.message.chat.id, call.message.message_id, 
+                             reply_markup=markup, parse_mode="Markdown")
+
+    @bot.callback_query_handler(func=lambda call: call.data == "back_to_list")
+    def callback_back_to_list(call):
+        handle_manage(call.message)
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("setlogo_"))
+    def callback_set_logo(call):
+        channel_id = call.data.split("_")[1]
+        user_states[call.from_user.id] = {"action": "waiting_for_logo", "channel_id": channel_id}
+        
+        text = (
+            "🖼️ *העלאת לוגו לערוץ*\n\n"
+            "אנא שלח כעת את קובץ התמונה שברצונך להציג (PNG או JPG).\n"
+            "מומלץ להשתמש בתמונה עם רקע שקוף.\n\n"
+            "💡 _לביטול שלח /cancel_"
+        )
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+
+    @bot.message_handler(content_types=['photo'], chat_types=['private'])
+    def handle_logo_upload(message):
+        user_id = message.from_user.id
+        state = user_states.get(user_id)
+        
+        if not state or state.get("action") != "waiting_for_logo":
+            return
+
+        channel_id = state["channel_id"]
+        # Download photo
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        temp_logo_path = OUTPUT_DIR / f"temp_logo_{user_id}.png"
+        with open(temp_logo_path, "wb") as f:
+            f.write(downloaded_file)
+        
+        # Generate Preview
+        bot.send_message(message.chat.id, "מייצר תצוגה מקדימה, אנא המתן...")
+        
         try:
-            bot.reply_to(message, "🛑 המערכת הוסרה בהצלחה. לא יישלחו יותר התרעות לערוץ זה.")
-        except Exception:
-            pass
+            from screenshot_overlay import overlay_screenshot
+            # Use a dummy background or current raw if exists
+            raw_files = list(OUTPUT_DIR.glob("raw_capture_*.png"))
+            
+            if not raw_files:
+                # No raw capture found, use a dark placeholder image
+                preview_path = OUTPUT_DIR / f"preview_{user_id}.png"
+                placeholder = Image.new("RGBA", (VIEWPORT_SIZE, VIEWPORT_SIZE), (30, 30, 40, 255))
+                placeholder_raw = OUTPUT_DIR / f"placeholder_raw_{user_id}.png"
+                placeholder.save(placeholder_raw)
+                overlay_screenshot(placeholder_raw, preview_path, custom_logo_path=temp_logo_path)
+                placeholder_raw.unlink(missing_ok=True)
+                
+                with open(preview_path, "rb") as f:
+                    bot.send_photo(message.chat.id, f, caption="שימו לב: לא נמצא צילום מפה עדכני, זהו רקע לדוגמה. האם לאשר את הלוגו?")
+            else:
+                preview_path = OUTPUT_DIR / f"preview_{user_id}.png"
+                overlay_screenshot(raw_files[-1], preview_path, custom_logo_path=temp_logo_path)
+                with open(preview_path, "rb") as f:
+                    bot.send_photo(message.chat.id, f, caption="כך יראה הצילום עם הלוגו שלך. לאשר?")
+            
+            user_states[user_id]["action"] = "confirm_logo"
+            user_states[user_id]["temp_path"] = str(temp_logo_path)
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("✅ אשר", callback_data="confirmlogo_yes"))
+            markup.add(types.InlineKeyboardButton("❌ בטל", callback_data="confirmlogo_no"))
+            bot.send_message(message.chat.id, "האם לאשר את הלוגו?", reply_markup=markup)
+            
+        except Exception as e:
+            log.error("Preview generation failed: %s", e)
+            bot.send_message(message.chat.id, "נכשלה יצירת תצוגה מקדימה. וודא שהקובץ תקין.")
 
-    log.info("👂 Telegram command listener started (polling)...")
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("confirmlogo_"))
+    def callback_confirm_logo(call):
+        user_id = call.from_user.id
+        state = user_states.get(user_id)
+        if not state or state.get("action") != "confirm_logo":
+            return
+        
+        if call.data == "confirmlogo_yes":
+            channel_id = state["channel_id"]
+            temp_path = Path(state["temp_path"])
+            final_path = CUSTOM_LOGOS_DIR / f"{channel_id}.png"
+            temp_path.replace(final_path)
+            bot.edit_message_text("✅ הלוגו עודכן בהצלחה!", call.message.chat.id, call.message.message_id)
+        else:
+            if "temp_path" in state:
+                Path(state["temp_path"]).unlink(missing_ok=True)
+            bot.edit_message_text("❌ הפעולה בוטלה.", call.message.chat.id, call.message.message_id)
+        
+        user_states.pop(user_id, None)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("removelogo_"))
+    def callback_remove_logo(call):
+        channel_id = call.data.split("_")[1]
+        for ext in (".png", ".jpg", ".jpeg"):
+            p = CUSTOM_LOGOS_DIR / f"{channel_id}{ext}"
+            p.unlink(missing_ok=True)
+        bot.edit_message_text("✅ הלוגו הוסר.", call.message.chat.id, call.message.message_id)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("unregister_"))
+    def callback_unregister(call):
+        channel_id = call.data.split("_")[1]
+        remove_subscriber(channel_id)
+        bot.edit_message_text(f"✅ ערוץ {channel_id} הוסר מהמערכת.", call.message.chat.id, call.message.message_id)
+
+    @bot.message_handler(commands=['cancel'], chat_types=['private'])
+    def handle_cancel(message):
+        user_id = message.from_user.id
+        if user_id in user_states:
+            state = user_states.pop(user_id)
+            if "temp_path" in state:
+                Path(state["temp_path"]).unlink(missing_ok=True)
+            bot.reply_to(message, "הפעולה בוטלה.")
+        else:
+            bot.reply_to(message, "אין פעולה פעילה לביטול.")
+
+    # Auto-register when added to a channel
+    @bot.my_chat_member_handler()
+    def handle_my_chat_member_update(update):
+        new = update.new_chat_member
+        if new.status in ("administrator", "member"):
+            chat_id = update.chat.id
+            chat_title = update.chat.title or "Channel"
+            # We only care about channels/groups for broadcasting
+            if update.chat.type in ("channel", "group", "supergroup"):
+                add_subscriber(chat_id, chat_title)
+                log.info("🤖 Added to %s (%s)", update.chat.type, chat_title)
+                
+                # Send a welcome message to the channel
+                welcome_text = (
+                    "👋 *הבוט של ClearMap חובר בהצלחה!*\n\n"
+                    "כדי להגדיר לוגו מותאם אישית ולנהל את ההגדרות, "
+                    "אנא פנו אל הבוט ב**צ'אט פרטי** ושלחו את הפקודה /manage."
+                )
+                try:
+                    bot.send_message(chat_id, welcome_text, parse_mode="Markdown")
+                except Exception:
+                    pass
+        elif new.status in ("left", "kicked"):
+            remove_subscriber(str(update.chat.id))
+
+    log.info("👂 Telegram private-chat manager started (polling)...")
     while True:
         try:
             bot.polling(none_stop=True, interval=3, timeout=20)
@@ -367,13 +615,17 @@ def telegram_listener():
             time.sleep(10)
 
 
+
 # ── Telegram Sender ─────────────────────────────────────────────────────────
 
-def broadcast_to_subscribers(photo_path: Path, caption: str):
-    """Send the alert photo to all registered subscribers."""
+def broadcast_to_subscribers(caption: str, theme: str = "dark"):
+    """
+    Capture a raw screenshot once, then overlay and broadcast 
+    custom-branded screenshots to each registered subscriber.
+    """
+    from screenshot_overlay import overlay_screenshot
+
     subscribers = get_subscribers()
-    
-    # Also include the legacy/default channel if it's not in the list
     if TELEGRAM_CHANNEL_ID and TELEGRAM_CHANNEL_ID not in subscribers:
         subscribers.append(TELEGRAM_CHANNEL_ID)
 
@@ -381,26 +633,68 @@ def broadcast_to_subscribers(photo_path: Path, caption: str):
         log.warning("📸 No subscribers found for broadcast!")
         return
 
-    log.info("📸 Broadcasting to %d subscribers...", len(subscribers))
-    
+    # 1. Capture Raw Screenshot (no overlays yet)
+    try:
+        # We use a temporary dummy path for capture_screenshot's final output
+        # and it returns the raw path as well.
+        dummy_path = OUTPUT_DIR / "dummy.png"
+        _, raw_file = capture_screenshot(SCREENSHOT_URL, dummy_path, theme=theme)
+    except Exception as e:
+        log.error("📸 Failed to capture base screenshot: %s", e)
+        return
+
+    # Group subscribers by custom logo
+    logo_groups = defaultdict(list)
     for chat_id in subscribers:
+        # Try different extensions
+        found_logo = None
+        for ext in (".png", ".jpg", ".jpeg"):
+            p = CUSTOM_LOGOS_DIR / f"{chat_id}{ext}"
+            if p.exists():
+                found_logo = p
+                break
+        logo_groups[found_logo].append(chat_id)
+
+    log.info("📸 Broadcasting to %d subscribers in %d logo groups...", 
+             len(subscribers), len(logo_groups))
+
+    # For each group, generate an overlaid screenshot and send
+    for logo_path, chat_ids in logo_groups.items():
+        group_name = logo_path.name if logo_path else "default"
+        final_path = OUTPUT_DIR / f"broadcast_{group_name}_{int(time.time())}.png"
+        
         try:
-            with open(photo_path, "rb") as f:
-                resp = requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                    data={"chat_id": chat_id, "caption": caption},
-                    files={"photo": ("alert.png", f, "image/png")},
-                    timeout=30,
-                )
-            if resp.ok:
-                log.info("   ✅ Sent to %s", chat_id)
-            elif resp.status_code == 403:
-                log.warning("   ❌ Forbidden (bot kicked) from %s — removing subscriber", chat_id)
-                remove_subscriber(chat_id)
-            else:
-                log.error("   ❌ Failed for %s: %s", chat_id, resp.text[:100])
+            overlay_screenshot(raw_file, final_path, theme=theme, custom_logo_path=logo_path)
+            
+            for chat_id in chat_ids:
+                try:
+                    with open(final_path, "rb") as f:
+                        resp = requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                            data={"chat_id": chat_id, "caption": caption},
+                            files={"photo": (f"alert_{group_name}.png", f, "image/png")},
+                            timeout=30,
+                        )
+                    if resp.ok:
+                        log.info("   ✅ Sent to %s (%s)", chat_id, group_name)
+                    elif resp.status_code == 403:
+                        log.warning("   ❌ Forbidden from %s — removing", chat_id)
+                        remove_subscriber(chat_id)
+                    else:
+                        log.error("   ❌ Failed for %s: %s", chat_id, resp.text[:100])
+                except Exception as e:
+                    log.error("   ❌ Error sending to %s: %s", chat_id, e)
+            
+            # Clean up group-specific screenshot
+            final_path.unlink(missing_ok=True)
         except Exception as e:
-            log.error("   ❌ Error sending to %s: %s", chat_id, e)
+            log.error("📸 Failed to overlay/send for group %s: %s", group_name, e)
+
+    # Clean up raw file and dummy
+    raw_file.unlink(missing_ok=True)
+    dummy_path.unlink(missing_ok=True)
+
+
 
 
 # ── Alert Change Detection (Firebase Listener) ─────────────────────────────
@@ -500,14 +794,13 @@ def main():
                             log.info("📸 Cooldown & batch window elapsed — capturing screenshot for %d alerts",
                                      len(real_alerts))
                             try:
-                                final_path = OUTPUT_DIR / "broadcast_latest.png"
-                                capture_screenshot(SCREENSHOT_URL, final_path)
                                 caption = _build_caption(current_data)
                                 log.info("📸 Caption: %s", caption)
-                                broadcast_to_subscribers(final_path, caption)
+                                broadcast_to_subscribers(caption)
                                 last_screenshot_time = time.time()
                             except Exception as e:
                                 log.error("📸 Screenshot/broadcast failed: %s", e)
+
                         else:
                             log.info("📸 Alerts cleared before screenshot — cancelling.")
 
