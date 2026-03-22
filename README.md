@@ -54,6 +54,7 @@ docker run -d \
   --name clearmap-screenshots \
   -v $(pwd)/config.env:/app/config.env:ro \
   -v $(pwd)/serviceAccountKey.json:/app/serviceAccountKey.json:ro \
+  -v $(pwd)/public:/app/public \
   clearmap-screenshots
 ```
 

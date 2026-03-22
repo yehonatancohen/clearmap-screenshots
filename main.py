@@ -64,6 +64,11 @@ FIREBASE_SUBSCRIBERS = "/public_state/subscribers"
 VIEWPORT_SIZE = 900
 OUTPUT_DIR = Path(__file__).parent / "screenshots"
 LOGO_DIR = Path(__file__).parent / "public"
+CUSTOM_LOGOS_DIR = LOGO_DIR / "custom_logos"
+
+# Ensure directories exist
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CUSTOM_LOGOS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 
@@ -300,44 +305,6 @@ def _build_caption(alerts_data: dict) -> str:
         caption = " | ".join(summary_parts) + "\n\nלצפייה במפה החיה ועדכונים בזמן אמת:\n🗺 clearmap.co.il"
 
     return caption
-
-
-# ── Telegram Subscriber Management ──────────────────────────────────────────
-
-def get_subscribers() -> list[str]:
-    """Fetch the list of subscriber chat IDs from Firebase."""
-    try:
-        ref = db.reference(FIREBASE_SUBSCRIBERS)
-        subs = ref.get()
-        if isinstance(subs, dict):
-            return [str(chat_id) for chat_id in subs.keys()]
-        return []
-    except Exception as e:
-        log.error("Failed to fetch subscribers: %s", e)
-        return []
-
-
-def add_subscriber(chat_id: int, chat_title: str = ""):
-    """Save a new chat_id to the Firebase subscribers list."""
-    try:
-        ref = db.reference(f"{FIREBASE_SUBSCRIBERS}/{chat_id}")
-        ref.set({
-            "added_at": int(time.time()),
-            "title": chat_title
-        })
-        log.info("👤 New subscriber added: %s (%s)", chat_id, chat_title)
-    except Exception as e:
-        log.error("Failed to add subscriber %s: %s", chat_id, e)
-
-
-def remove_subscriber(chat_id: str):
-    """Remove a chat_id from the Firebase subscribers list."""
-    try:
-        ref = db.reference(f"{FIREBASE_SUBSCRIBERS}/{chat_id}")
-        ref.delete()
-        log.info("👤 Subscriber removed: %s", chat_id)
-    except Exception as e:
-        log.error("Failed to remove subscriber %s: %s", chat_id, e)
 
 
 # ── Telegram Subscriber Management ──────────────────────────────────────────
@@ -732,8 +699,6 @@ def main():
         sys.exit(1)
 
     init_firebase()
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # State tracking
     last_screenshot_time = 0.0

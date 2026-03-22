@@ -25,6 +25,9 @@ COPY district_to_areas.py ./
 
 # serviceAccountKey.json is mounted at runtime (not baked into image)
 
+# Declare public directory as a volume for persistent logos and fonts
+VOLUME ["/app/public"]
+
 ENV PYTHONUNBUFFERED=1
 
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
