@@ -477,12 +477,12 @@ def telegram_listener():
         text = (
             "🖼️ *העלאת לוגו לערוץ*\n\n"
             "אנא שלח כעת את קובץ התמונה שברצונך להציג (PNG או JPG).\n"
-            "מומלץ להשתמש בתמונה עם רקע שקוף.\n\n"
+            "💡 *טיפ:* כדי לשמור על רקע שקוף, מומלץ לשלוח את הלוגו כ**קובץ** (File/Document) ולא כתמונה רגילה.\n\n"
             "💡 _לביטול שלח /cancel_"
         )
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
 
-    @bot.message_handler(content_types=['photo'], chat_types=['private'])
+    @bot.message_handler(content_types=['photo', 'document'], chat_types=['private'])
     def handle_logo_upload(message):
         user_id = message.from_user.id
         state = user_states.get(user_id)
@@ -491,8 +491,18 @@ def telegram_listener():
             return
 
         channel_id = state["channel_id"]
-        # Download photo
-        file_info = bot.get_file(message.photo[-1].file_id)
+        
+        # Determine file_id based on content type
+        if message.content_type == 'photo':
+            file_id = message.photo[-1].file_id
+        else:
+            if not message.document.mime_type or not message.document.mime_type.startswith('image/'):
+                bot.reply_to(message, "❌ הקובץ ששלחת אינו תמונה נתמכת. אנא שלח קובץ תמונה (PNG/JPG).")
+                return
+            file_id = message.document.file_id
+
+        # Download file
+        file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
         temp_logo_path = OUTPUT_DIR / f"temp_logo_{user_id}.png"
