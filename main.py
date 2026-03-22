@@ -585,13 +585,13 @@ def telegram_listener():
     @bot.my_chat_member_handler()
     def handle_my_chat_member_update(update):
         new = update.new_chat_member
+        chat_id = update.chat.id
+        chat_title = update.chat.title or "Channel"
+        log.info("🔄 Bot status update in %s (%s): %s", update.chat.type, chat_id, new.status)
+
         if new.status in ("administrator", "member"):
-            chat_id = update.chat.id
-            chat_title = update.chat.title or "Channel"
-            # We only care about channels/groups for broadcasting
             if update.chat.type in ("channel", "group", "supergroup"):
                 add_subscriber(chat_id, chat_title)
-                log.info("🤖 Added to %s (%s)", update.chat.type, chat_title)
                 
                 # Send a welcome message to the channel
                 welcome_text = (
@@ -601,15 +601,25 @@ def telegram_listener():
                 )
                 try:
                     bot.send_message(chat_id, welcome_text, parse_mode="Markdown")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.error("Could not send welcome message to %s: %s", chat_id, e)
         elif new.status in ("left", "kicked"):
-            remove_subscriber(str(update.chat.id))
+            remove_subscriber(str(chat_id))
+
+    # Fallback manual registration for channels/groups
+    @bot.message_handler(commands=['register', 'reg'], chat_types=['channel', 'group', 'supergroup'])
+    def handle_manual_register(message):
+        chat_id = message.chat.id
+        chat_title = message.chat.title or "Channel"
+        add_subscriber(chat_id, chat_title)
+        bot.reply_to(message, "✅ הערוץ נרשם במערכת בהצלחה! ניתן לנהל אותו כעת מהצ'אט הפרטי עם הבוט.")
 
     log.info("👂 Telegram private-chat manager started (polling)...")
     while True:
         try:
-            bot.polling(none_stop=True, interval=3, timeout=20)
+            # Explicitly allow my_chat_member updates
+            bot.polling(none_stop=True, interval=3, timeout=20, 
+                        allowed_updates=["message", "callback_query", "my_chat_member", "chat_member"])
         except Exception as e:
             log.error("Telegram polling error: %s", e)
             time.sleep(10)
