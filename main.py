@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 import time
+import shutil
 import threading
 from collections import defaultdict
 from datetime import datetime
@@ -524,7 +525,7 @@ def telegram_listener():
             channel_id = state["channel_id"]
             temp_path = Path(state["temp_path"])
             final_path = CUSTOM_LOGOS_DIR / f"{channel_id}.png"
-            temp_path.replace(final_path)
+            shutil.move(str(temp_path), str(final_path))
             bot.edit_message_text("✅ הלוגו עודכן בהצלחה!", call.message.chat.id, call.message.message_id)
         else:
             if "temp_path" in state:
