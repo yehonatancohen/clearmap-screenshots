@@ -777,6 +777,9 @@ def main():
                                 pending_screenshot = False
                                 continue
 
+                            # Clear the flag BEFORE the blocking broadcast so that any new
+                            # alerts arriving during capture/send can re-arm it correctly.
+                            pending_screenshot = False
                             log.info("📸 Cooldown & batch window elapsed — capturing screenshot for %d alerts",
                                      len(real_alerts))
                             try:
@@ -789,8 +792,7 @@ def main():
 
                         else:
                             log.info("📸 Alerts cleared before screenshot — cancelling.")
-
-                        pending_screenshot = False
+                            pending_screenshot = False
                     else:
                         remaining = SCREENSHOT_COOLDOWN - time_since_last
                         if int(remaining) % 30 == 0:
