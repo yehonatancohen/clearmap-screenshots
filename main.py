@@ -604,6 +604,36 @@ def telegram_listener():
 
 
 
+# ── Per-channel last message tracking ───────────────────────────────────────
+
+# Maps chat_id -> message_id of the most recently sent alert photo.
+# Used to delete the old message before sending a new one so the channel
+# doesn't accumulate a backlog of stale screenshots.
+_last_message_ids: dict[str, int] = {}
+
+
+def _delete_last_message(chat_id: str) -> None:
+    """Delete the previous alert message for this channel, if any."""
+    msg_id = _last_message_ids.get(chat_id)
+    if not msg_id:
+        return
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
+            data={"chat_id": chat_id, "message_id": msg_id},
+            timeout=10,
+        )
+        if resp.ok:
+            log.info("   🗑️  Deleted previous message %s in %s", msg_id, chat_id)
+        else:
+            # Message may already be gone (too old, manually deleted, etc.) — not an error
+            log.debug("   ⚠️  Could not delete message %s in %s: %s", msg_id, chat_id, resp.text[:80])
+    except Exception as e:
+        log.debug("   ⚠️  Delete attempt failed for %s: %s", chat_id, e)
+    finally:
+        _last_message_ids.pop(chat_id, None)
+
+
 # ── Telegram Sender ─────────────────────────────────────────────────────────
 
 def broadcast_to_subscribers(caption: str, theme: str = "dark"):
@@ -656,6 +686,7 @@ def broadcast_to_subscribers(caption: str, theme: str = "dark"):
             
             for chat_id in chat_ids:
                 try:
+                    _delete_last_message(chat_id)
                     with open(final_path, "rb") as f:
                         resp = requests.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
@@ -664,7 +695,10 @@ def broadcast_to_subscribers(caption: str, theme: str = "dark"):
                             timeout=30,
                         )
                     if resp.ok:
-                        log.info("   ✅ Sent to %s (%s)", chat_id, group_name)
+                        msg_id = resp.json().get("result", {}).get("message_id")
+                        if msg_id:
+                            _last_message_ids[chat_id] = msg_id
+                        log.info("   ✅ Sent to %s (%s) [msg_id=%s]", chat_id, group_name, msg_id)
                     elif resp.status_code == 403:
                         log.warning("   ❌ Forbidden from %s — removing", chat_id)
                         remove_subscriber(chat_id)
