@@ -58,6 +58,9 @@ TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "") or _cfg.get("TEL
 SCREENSHOT_URL = os.environ.get("SCREENSHOT_URL", "") or _cfg.get("SCREENSHOT_URL", "https://www.clearmap.co.il/broadcast?uav=true&ellipse=true")
 SCREENSHOT_COOLDOWN = int(os.environ.get("SCREENSHOT_COOLDOWN", "") or _cfg.get("SCREENSHOT_COOLDOWN", "120"))
 BATCH_DELAY = int(os.environ.get("SCREENSHOT_BATCH_DELAY", "") or _cfg.get("SCREENSHOT_BATCH_DELAY", "10"))
+# If new alerts arrive within this many seconds of the last broadcast,
+# edit the existing Telegram message instead of sending a new one.
+EDIT_WINDOW = int(os.environ.get("SCREENSHOT_EDIT_WINDOW", "") or _cfg.get("SCREENSHOT_EDIT_WINDOW", "300"))
 FIREBASE_DB_URL = "https://clear-map-f20d0-default-rtdb.europe-west1.firebasedatabase.app/"
 FIREBASE_NODE = "/public_state/active_alerts"
 FIREBASE_SUBSCRIBERS = "/public_state/subscribers"
@@ -606,12 +609,26 @@ def telegram_listener():
 
 # ── Telegram Sender ─────────────────────────────────────────────────────────
 
-def broadcast_to_subscribers(caption: str, theme: str = "dark"):
+def broadcast_to_subscribers(
+    caption: str,
+    theme: str = "dark",
+    prev_message_ids: dict[str, int] | None = None,
+) -> dict[str, int]:
     """
-    Capture a raw screenshot once, then overlay and broadcast 
+    Capture a raw screenshot once, then overlay and broadcast
     custom-branded screenshots to each registered subscriber.
+
+    If prev_message_ids is provided, edits those messages in-place
+    (editMessageMedia) instead of sending new ones.
+
+    Returns a dict of {chat_id: message_id} for the sent/edited messages
+    so the caller can pass them back for future edits.
     """
     from screenshot_overlay import overlay_screenshot
+
+    sent_ids: dict[str, int] = {}
+    if prev_message_ids is None:
+        prev_message_ids = {}
 
     subscribers = get_subscribers()
     if TELEGRAM_CHANNEL_ID and TELEGRAM_CHANNEL_ID not in subscribers:
@@ -619,22 +636,19 @@ def broadcast_to_subscribers(caption: str, theme: str = "dark"):
 
     if not subscribers:
         log.warning("📸 No subscribers found for broadcast!")
-        return
+        return sent_ids
 
     # 1. Capture Raw Screenshot (no overlays yet)
     try:
-        # We use a temporary dummy path for capture_screenshot's final output
-        # and it returns the raw path as well.
         dummy_path = OUTPUT_DIR / "dummy.png"
         _, raw_file = capture_screenshot(SCREENSHOT_URL, dummy_path, theme=theme)
     except Exception as e:
         log.error("📸 Failed to capture base screenshot: %s", e)
-        return
+        return sent_ids
 
     # Group subscribers by custom logo
     logo_groups = defaultdict(list)
     for chat_id in subscribers:
-        # Try different extensions
         found_logo = None
         for ext in (".png", ".jpg", ".jpeg"):
             p = CUSTOM_LOGOS_DIR / f"{chat_id}{ext}"
@@ -643,44 +657,79 @@ def broadcast_to_subscribers(caption: str, theme: str = "dark"):
                 break
         logo_groups[found_logo].append(chat_id)
 
-    log.info("📸 Broadcasting to %d subscribers in %d logo groups...", 
+    is_edit = len(prev_message_ids) > 0
+    log.info("📸 %s to %d subscribers in %d logo groups...",
+             "Editing" if is_edit else "Broadcasting",
              len(subscribers), len(logo_groups))
 
-    # For each group, generate an overlaid screenshot and send
     for logo_path, chat_ids in logo_groups.items():
         group_name = logo_path.name if logo_path else "default"
         final_path = OUTPUT_DIR / f"broadcast_{group_name}_{int(time.time())}.png"
-        
+
         try:
             overlay_screenshot(raw_file, final_path, theme=theme, custom_logo_path=logo_path)
-            
+
             for chat_id in chat_ids:
+                prev_msg_id = prev_message_ids.get(chat_id)
                 try:
-                    with open(final_path, "rb") as f:
-                        resp = requests.post(
-                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                            data={"chat_id": chat_id, "caption": caption},
-                            files={"photo": (f"alert_{group_name}.png", f, "image/png")},
-                            timeout=30,
-                        )
-                    if resp.ok:
-                        log.info("   ✅ Sent to %s (%s)", chat_id, group_name)
-                    elif resp.status_code == 403:
-                        log.warning("   ❌ Forbidden from %s — removing", chat_id)
-                        remove_subscriber(chat_id)
-                    else:
-                        log.error("   ❌ Failed for %s: %s", chat_id, resp.text[:100])
+                    if prev_msg_id:
+                        # Edit the existing message with updated screenshot + caption
+                        with open(final_path, "rb") as f:
+                            media_payload = json.dumps({
+                                "type": "photo",
+                                "media": "attach://photo",
+                                "caption": caption,
+                            })
+                            resp = requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageMedia",
+                                data={
+                                    "chat_id": chat_id,
+                                    "message_id": prev_msg_id,
+                                    "media": media_payload,
+                                },
+                                files={"photo": (f"alert_{group_name}.png", f, "image/png")},
+                                timeout=30,
+                            )
+                        if resp.ok:
+                            sent_ids[chat_id] = prev_msg_id
+                            log.info("   ✏️  Edited msg %s in %s (%s)", prev_msg_id, chat_id, group_name)
+                        else:
+                            # Edit failed (message deleted, too old, etc.) — fall back to new send
+                            log.warning("   ⚠️  Edit failed for %s (msg %s): %s — sending new",
+                                        chat_id, prev_msg_id, resp.text[:80])
+                            prev_msg_id = None  # trigger fallback below
+
+                    if not prev_msg_id:
+                        # Send a new message
+                        with open(final_path, "rb") as f:
+                            resp = requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                                data={"chat_id": chat_id, "caption": caption},
+                                files={"photo": (f"alert_{group_name}.png", f, "image/png")},
+                                timeout=30,
+                            )
+                        if resp.ok:
+                            msg_id = resp.json().get("result", {}).get("message_id")
+                            if msg_id:
+                                sent_ids[chat_id] = msg_id
+                            log.info("   ✅ Sent to %s (%s)", chat_id, group_name)
+                        elif resp.status_code == 403:
+                            log.warning("   ❌ Forbidden from %s — removing", chat_id)
+                            remove_subscriber(chat_id)
+                        else:
+                            log.error("   ❌ Failed for %s: %s", chat_id, resp.text[:100])
+
                 except Exception as e:
                     log.error("   ❌ Error sending to %s: %s", chat_id, e)
-            
-            # Clean up group-specific screenshot
+
             final_path.unlink(missing_ok=True)
         except Exception as e:
             log.error("📸 Failed to overlay/send for group %s: %s", group_name, e)
 
-    # Clean up raw file and dummy
     raw_file.unlink(missing_ok=True)
     dummy_path.unlink(missing_ok=True)
+
+    return sent_ids
 
 
 
@@ -708,6 +757,8 @@ def main():
     previous_primary_ids: set[str] = set()
     latest_snapshot: dict = {}
     snapshot_lock = threading.Lock()
+    # For edit-in-place: maps chat_id → message_id of the last broadcast
+    last_message_ids: dict[str, int] = {}
 
     def on_alerts_change(event):
         """Firebase listener callback — fires on every change to active_alerts."""
@@ -750,8 +801,8 @@ def main():
     # Start Telegram command listener
     threading.Thread(target=telegram_listener, daemon=True).start()
 
-    log.info("📸 Broadcast config: cooldown=%ds batch_delay=%ds",
-             SCREENSHOT_COOLDOWN, BATCH_DELAY)
+    log.info("📸 Broadcast config: cooldown=%ds batch_delay=%ds edit_window=%ds",
+             SCREENSHOT_COOLDOWN, BATCH_DELAY, EDIT_WINDOW)
 
     # Main loop — handles batching and cooldown
     while True:
@@ -761,7 +812,9 @@ def main():
 
                 if now >= sliding_window_end:
                     time_since_last = now - last_screenshot_time
-                    if time_since_last >= SCREENSHOT_COOLDOWN:
+                    # Allow through if cooldown elapsed OR if we can edit a recent message
+                    can_edit = (time_since_last < EDIT_WINDOW and bool(last_message_ids))
+                    if time_since_last >= SCREENSHOT_COOLDOWN or can_edit:
                         with snapshot_lock:
                             current_data = dict(latest_snapshot)
 
@@ -785,7 +838,21 @@ def main():
                             try:
                                 caption = _build_caption(current_data)
                                 log.info("📸 Caption: %s", caption)
-                                broadcast_to_subscribers(caption)
+
+                                # If within EDIT_WINDOW of last broadcast, edit
+                                # existing messages instead of sending new ones.
+                                time_since_last = now - last_screenshot_time
+                                edit_ids = last_message_ids if (
+                                    time_since_last < EDIT_WINDOW and last_message_ids
+                                ) else None
+
+                                if edit_ids:
+                                    log.info("📸 Within edit window (%.0fs < %ds) — editing existing messages",
+                                             time_since_last, EDIT_WINDOW)
+
+                                last_message_ids = broadcast_to_subscribers(
+                                    caption, prev_message_ids=edit_ids,
+                                )
                                 last_screenshot_time = time.time()
                             except Exception as e:
                                 log.error("📸 Screenshot/broadcast failed: %s", e)
