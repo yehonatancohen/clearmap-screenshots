@@ -162,7 +162,23 @@ def capture_screenshot(url: str, output_path: Path, theme: str = "dark",
 
                 page.goto(screenshot_url, wait_until="load", timeout=45000)
                 page.wait_for_selector(".leaflet-container", timeout=15000)
-                time.sleep(3)  # Let map tiles render
+
+                # Wait for Leaflet tile images to finish loading.
+                # Tiles are fetched asynchronously after page load, so a fixed
+                # sleep is unreliable. Poll until all visible tile <img> elements
+                # report complete=true, with a 12s timeout before giving up.
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const tiles = document.querySelectorAll('img.leaflet-tile');
+                            return tiles.length > 0 &&
+                                   Array.from(tiles).every(t => t.complete && t.naturalWidth > 0);
+                        }""",
+                        timeout=12000,
+                    )
+                except Exception:
+                    log.warning("📸 Tile load wait timed out — taking screenshot anyway")
+                time.sleep(0.5)  # Brief pause for final paint
 
                 # Hide UI overlays — keep only map + polygons
                 page.evaluate("""
