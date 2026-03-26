@@ -770,7 +770,8 @@ def main():
     last_screenshot_time = 0.0
     sliding_window_end = 0.0
     pending_screenshot = False
-    previous_primary_ids: set[str] = set()
+    # Track (key, status) pairs so status upgrades (e.g. pre_alert → alert) are detected
+    previous_primary_pairs: set[tuple[str, str]] = set()
     latest_snapshot: dict = {}
     snapshot_lock = threading.Lock()
     # For edit-in-place: maps chat_id → message_id of the last broadcast
@@ -778,36 +779,39 @@ def main():
 
     def on_alerts_change(event):
         """Firebase listener callback — fires on every change to active_alerts."""
-        nonlocal pending_screenshot, sliding_window_end, previous_primary_ids, latest_snapshot
+        nonlocal pending_screenshot, sliding_window_end, previous_primary_pairs, latest_snapshot
 
+        # Always fetch full snapshot to avoid issues with Firebase patch events
+        # at path "/" that only contain changed entries.
         data = event.data
-        if event.path != "/" or data is None:
-            # Sub-key update or deletion — fetch full snapshot
+        if event.path != "/" or data is None or getattr(event, "event_type", None) == "patch":
             ref = db.reference(FIREBASE_NODE)
             data = ref.get() or {}
 
         with snapshot_lock:
             latest_snapshot = data if isinstance(data, dict) else {}
 
-        # Check if there are new primary alerts
-        current_primary_ids = set()
+        # Build (key, status) pairs so we detect both new alerts AND status upgrades
+        current_primary_pairs = set()
         if isinstance(data, dict):
             for key, alert in data.items():
-                if isinstance(alert, dict) and _is_primary_alert(alert.get("status", "")):
-                    # Skip test alerts
-                    if alert.get("is_test") or alert.get("test") or alert.get("isTest"):
-                        continue
-                    current_primary_ids.add(key)
+                if isinstance(alert, dict):
+                    status = alert.get("status", "")
+                    if _is_primary_alert(status):
+                        # Skip test alerts
+                        if alert.get("is_test") or alert.get("test") or alert.get("isTest"):
+                            continue
+                        current_primary_pairs.add((key, status))
 
-        new_primaries = current_primary_ids - previous_primary_ids
-        previous_primary_ids = current_primary_ids
+        new_or_changed = current_primary_pairs - previous_primary_pairs
+        previous_primary_pairs = current_primary_pairs
 
-        if new_primaries:
+        if new_or_changed:
             now = time.time()
             sliding_window_end = now + BATCH_DELAY
             pending_screenshot = True
-            log.info("🔔 %d new primary alert(s) detected! Sliding window set to %ds.",
-                     len(new_primaries), BATCH_DELAY)
+            log.info("🔔 %d new/upgraded primary alert(s) detected! Sliding window set to %ds.",
+                     len(new_or_changed), BATCH_DELAY)
 
     # Start Firebase listener
     log.info("👂 Listening for alert changes on Firebase: %s", FIREBASE_NODE)
