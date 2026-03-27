@@ -58,6 +58,7 @@ _cfg = _load_config_env()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("CLEARMAP_BOT_TOKEN", "") or _cfg.get("CLEARMAP_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "") or _cfg.get("TELEGRAM_CHANNEL_ID", "-1003879479829")
+ADMIN_ID = 985770181  # Global Admin ID
 # When set, routes ALL messages (including is_test alerts) only to this channel.
 # Use for end-to-end testing without hitting real subscribers.
 TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "") or _cfg.get("TEST_CHANNEL_ID", "")
@@ -441,9 +442,15 @@ def telegram_listener():
         subs = get_subscribers_data()
         
         managed_channels = []
-        for chat_id, data in subs.items():
-            if is_user_admin(chat_id, user_id):
+        if user_id == ADMIN_ID:
+            # Global Admin sees EVERYTHING
+            for chat_id, data in subs.items():
                 managed_channels.append((chat_id, data.get("title", chat_id)))
+        else:
+            # Regular users see only what they manage
+            for chat_id, data in subs.items():
+                if is_user_admin(chat_id, user_id):
+                    managed_channels.append((chat_id, data.get("title", chat_id)))
         
         if not managed_channels:
             text = (
@@ -460,26 +467,66 @@ def telegram_listener():
         for cid, title in managed_channels:
             markup.add(types.InlineKeyboardButton(f"📺 {title}", callback_data=f"manage_{cid}"))
         
-        bot.send_message(message.chat.id, "👇 *בחר את הערוץ שברצונך לנהל:*", reply_markup=markup, parse_mode="Markdown")
+        title_text = "🕵️ *ניהול מערכת (אדמין)*" if user_id == ADMIN_ID else "👇 *בחר את הערוץ שברצונך לנהל:*"
+        bot.send_message(message.chat.id, title_text, reply_markup=markup, parse_mode="Markdown")
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("manage_"))
     def callback_manage_channel(call):
         channel_id = call.data.split("_")[1]
         user_id = call.from_user.id
         
-        if not is_user_admin(channel_id, user_id):
+        if user_id != ADMIN_ID and not is_user_admin(channel_id, user_id):
             bot.answer_callback_query(call.id, "⚠️ אינך מנהל בערוץ זה יותר.", show_alert=True)
             return
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("🖼️ הגדרת לוגו חדש", callback_data=f"setlogo_{channel_id}"))
         markup.add(types.InlineKeyboardButton("🗑️ הסרת לוגו קיים", callback_data=f"removelogo_{channel_id}"))
+        
+        if user_id == ADMIN_ID:
+            # Admin features: Join Link
+            try:
+                invite = bot.export_chat_invite_link(channel_id)
+                markup.add(types.InlineKeyboardButton("🔗 קישור הצטרפות", url=invite))
+            except Exception:
+                markup.add(types.InlineKeyboardButton("🔗 קישור הצטרפות (אין הרשאה)", callback_data="none"))
+
         markup.add(types.InlineKeyboardButton("🚫 הפסקת התרעות לערוץ זה", callback_data=f"unregister_{channel_id}"))
         markup.add(types.InlineKeyboardButton("🔙 חזרה לרשימה", callback_data="back_to_list"))
         
         bot.edit_message_text(f"⚙️ *ניהול הגדרות עבור הערוץ:*\n`{channel_id}`", 
                              call.message.chat.id, call.message.message_id, 
                              reply_markup=markup, parse_mode="Markdown")
+
+    @bot.message_handler(commands=['broadcast_admin'], chat_types=['private'])
+    def handle_broadcast_admin(message):
+        if message.from_user.id != ADMIN_ID:
+            return
+        
+        user_states[ADMIN_ID] = {"action": "waiting_for_admin_broadcast"}
+        bot.reply_to(message, "📢 *שלח כעת את ההודעה שברצונך להפיץ לכל הערוצים הרשומים.*\n\nלביטול שלח /cancel", parse_mode="Markdown")
+
+    @bot.message_handler(func=lambda m: user_states.get(m.from_user.id, {}).get("action") == "waiting_for_admin_broadcast", chat_types=['private'])
+    def process_admin_broadcast(message):
+        if message.from_user.id != ADMIN_ID: return
+        
+        msg_text = message.text
+        user_states.pop(ADMIN_ID, None)
+        
+        subs = get_subscribers()
+        bot.reply_to(message, f"🚀 מתחיל הפצה ל-{len(subs)} ערוצים...")
+        
+        success = 0
+        fail = 0
+        for chat_id in subs:
+            try:
+                bot.send_message(chat_id, msg_text, parse_mode="Markdown")
+                success += 1
+            except Exception as e:
+                log.error("Failed broadcast to %s: %s", chat_id, e)
+                fail += 1
+        
+        bot.send_message(message.chat.id, f"✅ ההפצה הושלמה!\nהצלחה: {success}\nכישלון: {fail}")
 
     @bot.callback_query_handler(func=lambda call: call.data == "back_to_list")
     def callback_back_to_list(call):
