@@ -129,8 +129,9 @@ def init_firebase():
 
 # ── Screenshot Capture ──────────────────────────────────────────────────────
 
-def capture_screenshot(url: str, output_path: Path, theme: str = "dark", 
-                       size: int = 1080, custom_logo_path: Path | None = None) -> tuple[Path, Path]:
+def capture_screenshot(url: str, output_path: Path, theme: str = "dark",
+                       size: int = 1080, custom_logo_path: Path | None = None,
+                       init_script: str | None = None) -> tuple[Path, Path]:
     """
     Capture a screenshot of the map using Playwright, overlay logo + legend.
     Returns (final_output_path, raw_capture_path).
@@ -166,6 +167,8 @@ def capture_screenshot(url: str, output_path: Path, theme: str = "dark",
                     viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
                     device_scale_factor=1.5,
                 )
+                if init_script:
+                    context.add_init_script(init_script)
                 page = context.new_page()
 
                 page.goto(screenshot_url, wait_until="load", timeout=45000)
@@ -969,15 +972,20 @@ def _compute_group_diff(
 def _capture_raw_screenshot(theme: str = "dark") -> Path | None:
     """
     Capture one raw (no-overlay) screenshot of the map.
+    In test mode (TEST_CHANNEL_ID set), injects window.__showTestAlerts=true
+    into the browser context so the frontend renders is_test alerts — without
+    making test alerts visible to real website visitors.
     Returns the raw PNG path, or None on failure.
     """
     try:
+        init_script = "window.__showTestAlerts = true;" if TEST_CHANNEL_ID else None
         dummy_path = OUTPUT_DIR / f"dummy_{int(time.time())}.png"
-        _, raw_file = capture_screenshot(SCREENSHOT_URL, dummy_path, theme=theme)
+        _, raw_file = capture_screenshot(SCREENSHOT_URL, dummy_path, theme=theme,
+                                         init_script=init_script)
         dummy_path.unlink(missing_ok=True)
         return raw_file
     except Exception as e:
-        log.error("📸 Failed to capture raw screenshot: %s", e)
+        log.error("Screenshot capture failed: %s", e)
         return None
 
 
@@ -1286,7 +1294,7 @@ def main():
     log.info("📸 Broadcast config: cooldown=%ds batch_delay=%ds edit_window=%ds cluster_km=%.0f",
              SCREENSHOT_COOLDOWN, BATCH_DELAY, EDIT_WINDOW, GEO_CLUSTER_KM)
     if TEST_CHANNEL_ID:
-        log.warning("⚠️  TEST MODE: routing all messages (incl. is_test alerts) to %s only", TEST_CHANNEL_ID)
+        log.warning("TEST MODE active: routing all messages (incl. is_test alerts) to %s only", TEST_CHANNEL_ID)
 
     # Main loop — handles batching and cooldown
     while True:
