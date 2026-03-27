@@ -59,9 +59,9 @@ _cfg = _load_config_env()
 TELEGRAM_BOT_TOKEN = os.environ.get("CLEARMAP_BOT_TOKEN", "") or _cfg.get("CLEARMAP_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "") or _cfg.get("TELEGRAM_CHANNEL_ID", "-1003879479829")
 ADMIN_ID = 985770181  # Global Admin ID
-# When set, routes ALL messages (including is_test alerts) only to this channel.
-# Use for end-to-end testing without hitting real subscribers.
-TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "-5197151796") or _cfg.get("TEST_CHANNEL_ID", "")
+# When set, this specific channel receives ONLY test alerts (is_test=true).
+# Regular subscribers receive ONLY real alerts.
+TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "-5197151796") or _cfg.get("TEST_CHANNEL_ID", "-5197151796")
 SCREENSHOT_URL = os.environ.get("SCREENSHOT_URL", "") or _cfg.get("SCREENSHOT_URL", "https://www.clearmap.co.il/broadcast?uav=true&ellipse=true&theme=dark")
 SCREENSHOT_COOLDOWN = int(os.environ.get("SCREENSHOT_COOLDOWN", "") or _cfg.get("SCREENSHOT_COOLDOWN", "120"))
 BATCH_DELAY = int(os.environ.get("SCREENSHOT_BATCH_DELAY", "") or _cfg.get("SCREENSHOT_BATCH_DELAY", "10"))
@@ -1069,10 +1069,10 @@ def _compute_cluster_view(
     lon_span_km = (max(lons) - min(lons)) * 111.0 * math.cos(math.radians(center_lat))
     max_span_km = max(lat_span_km, lon_span_km, 1.0)
 
-    # 40% padding for a better context
-    padded_km = max_span_km * 1.4
-    # Base zoom 8.6 instead of 9.0 for a more balanced fit
-    zoom = max(7, min(13, round(8.6 + math.log2(400.0 / padded_km))))
+    # 60% padding for more context around the cluster
+    padded_km = max_span_km * 1.6
+    # Base zoom 8.3 to ensure all alerts fit comfortably
+    zoom = max(7, min(13, round(8.3 + math.log2(400.0 / padded_km))))
 
     return center_lat, center_lon, zoom
 
@@ -1111,9 +1111,10 @@ def _send_group_to_subscribers(
     raw_path: Path,
     theme: str = "dark",
     prev_message_ids: dict[str, int] | None = None,
+    target_subscribers: list[str] | None = None,
 ) -> dict[str, int]:
     """
-    Overlay and send (or edit) a screenshot to all subscribers for one geographic group.
+    Overlay and send (or edit) a screenshot to target subscribers for one geographic group.
     Reuses a pre-captured raw_path instead of launching a new browser.
     Returns {chat_id: message_id} for all successful sends/edits.
     """
@@ -1123,13 +1124,12 @@ def _send_group_to_subscribers(
     if prev_message_ids is None:
         prev_message_ids = {}
 
-    if TEST_CHANNEL_ID:
-        subscribers = [TEST_CHANNEL_ID]
-        log.info("📸 TEST_CHANNEL_ID set — routing to test channel only: %s", TEST_CHANNEL_ID)
-    else:
+    if target_subscribers is None:
         subscribers = get_subscribers()
         if TELEGRAM_CHANNEL_ID and TELEGRAM_CHANNEL_ID not in subscribers:
             subscribers.append(TELEGRAM_CHANNEL_ID)
+    else:
+        subscribers = target_subscribers
 
     if not subscribers:
         log.warning("📸 No subscribers for group broadcast!")
@@ -1219,89 +1219,87 @@ def broadcast_all_groups(
     alerts_data: dict,
     centroids: dict[str, tuple[float, float]],
     theme: str = "dark",
+    is_test_run: bool = False,
 ) -> None:
     """
     Geographic-aware broadcast: sends separate Telegram messages per contiguous
-    cluster of alerted cities. Edits existing messages when only new cities of the
-    same status join a group; sends new messages on status upgrades or new clusters.
-    Mutates active_groups in-place.
+    cluster of alerted cities.
     """
     now = time.time()
 
-    # Build city_by_status for all active primary alerts.
-    # In test mode (TEST_CHANNEL_ID set), include is_test alerts too.
+    target_subscribers = None
+    if is_test_run:
+        if not TEST_CHANNEL_ID: return
+        target_subscribers = [TEST_CHANNEL_ID]
+
+    # Build city_by_status
     city_by_status: dict[str, str] = {}
     for _key, alert in alerts_data.items():
-        if not isinstance(alert, dict):
-            continue
-        if not TEST_CHANNEL_ID and (alert.get("is_test") or alert.get("test") or alert.get("isTest")):
-            continue
+        if not isinstance(alert, dict): continue
+        is_alert_test = alert.get("is_test") or alert.get("test") or alert.get("isTest")
+        
+        if is_test_run and not is_alert_test: continue
+        if not is_test_run and is_alert_test: continue
+        
         status = alert.get("status", "")
         city_he = alert.get("city_name_he", "")
         if city_he and _is_primary_alert(status):
             city_by_status[city_he] = status
 
     if not city_by_status:
-        log.info("📸 No primary alerts — skipping broadcast_all_groups")
         return
 
     # Cluster active cities geographically
     new_clusters = _cluster_cities(list(city_by_status.keys()), centroids)
-    log.info("📸 %d alert cities → %d geographic cluster(s)", len(city_by_status), len(new_clusters))
-    for i, c in enumerate(new_clusters):
-        log.info("  Cluster %d (%d cities): %s", i + 1, len(c), ", ".join(sorted(c)))
+    log.info("📸 [%s] %d alert cities → %d geographic cluster(s)", 
+             "TEST" if is_test_run else "REAL", len(city_by_status), len(new_clusters))
 
     # Match clusters to existing group states
     matched, unmatched_new, orphaned = _match_clusters_to_states(new_clusters, active_groups)
 
-    # Process matched clusters — each gets its own screenshot centred on the cluster
+    # Process matched clusters
     for ci, (cluster_cities, state) in matched.items():
         cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
         new_same, upgraded = _compute_group_diff(cluster_city_by_status, state)
 
         if not new_same and not upgraded:
-            # No actionable change — update city_names in case cluster shape shifted
             state.city_names = cluster_cities
             continue
 
         new_snapshot = {s: frozenset(cs) for s, cs in
                         _group_cities_by_status(cluster_city_by_status).items()}
 
-        # Combine all changed cities (newly alerted or upgraded from pre_alert)
         changed_cities = new_same.copy()
         for upgraded_set in upgraded.values():
             changed_cities.update(upgraded_set)
 
-        within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids)
+        is_upgrade = len(upgraded) > 0
+        within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids) and not is_upgrade
 
         if within_edit:
-            # EDIT existing message: Focus on the WHOLE cluster to provide context
             lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
-            log.info("📸 Group %d: %d changed city/cities → edit (%.0fs < %ds, zoom=%s)",
-                     state.group_id, len(changed_cities),
-                     now - state.last_broadcast_time, EDIT_WINDOW, zoom)
+            log.info("📸 Group %d (%s): %d changed → edit", state.group_id, "TEST" if is_test_run else "REAL", len(changed_cities))
             caption = _build_caption(alerts_data, city_filter=cluster_cities)
             raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
             if raw_path:
                 new_ids = _send_group_to_subscribers(caption, raw_path, theme,
-                                                     prev_message_ids=state.message_ids)
+                                                     prev_message_ids=state.message_ids,
+                                                     target_subscribers=target_subscribers)
                 raw_path.unlink(missing_ok=True)
                 state.message_ids = new_ids
         else:
-            # NEW message: Focus on the NEW activity specifically
-            lat, lon, zoom = _compute_cluster_view(changed_cities, centroids)
+            focus_cities = changed_cities
+            lat, lon, zoom = _compute_cluster_view(focus_cities, centroids)
             if lat is None:
                 lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
 
-            log.info("📸 Group %d: %d changed city/cities → new message (zoom=%s)",
-                     state.group_id, len(changed_cities), zoom)
-            # For new messages, caption shows the relevant subset (or whole cluster if not upgrade)
-            caption_filter = changed_cities if upgraded else cluster_cities
-            caption = _build_caption(alerts_data, city_filter=caption_filter)
-            
+            log.info("📸 Group %d (%s): %d changed → new message", state.group_id, "TEST" if is_test_run else "REAL", len(changed_cities))
+            caption = _build_caption(alerts_data, city_filter=cluster_cities)
             raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
             if raw_path:
-                new_ids = _send_group_to_subscribers(caption, raw_path, theme, prev_message_ids=None)
+                new_ids = _send_group_to_subscribers(caption, raw_path, theme, 
+                                                     prev_message_ids=None,
+                                                     target_subscribers=target_subscribers)
                 raw_path.unlink(missing_ok=True)
                 state.message_ids = new_ids
 
@@ -1311,33 +1309,30 @@ def broadcast_all_groups(
 
     # Process brand-new clusters
     for cluster_cities in unmatched_new:
-        cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
         caption = _build_caption(alerts_data, city_filter=cluster_cities)
         lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
-        log.info("📸 New geographic group of %d city/cities → new message (zoom=%s)",
-                 len(cluster_cities), zoom)
+        log.info("📸 New group (%s) of %d cities → new message", "TEST" if is_test_run else "REAL", len(cluster_cities))
         raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
         if raw_path:
-            new_ids = _send_group_to_subscribers(caption, raw_path, theme, prev_message_ids=None)
+            new_ids = _send_group_to_subscribers(caption, raw_path, theme, 
+                                                 prev_message_ids=None,
+                                                 target_subscribers=target_subscribers)
             raw_path.unlink(missing_ok=True)
         else:
             new_ids = {}
 
+        cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
         new_snapshot = {s: frozenset(cs) for s, cs in
                         _group_cities_by_status(cluster_city_by_status).items()}
         group_id = next(_group_id_counter)
         active_groups[group_id] = GroupState(
-            group_id=group_id,
-            city_names=cluster_cities,
-            last_broadcast_snapshot=new_snapshot,
-            message_ids=new_ids,
+            group_id=group_id, city_names=cluster_cities,
+            last_broadcast_snapshot=new_snapshot, message_ids=new_ids,
             last_broadcast_time=now,
         )
 
-    # Remove orphaned states (alerts cleared for those areas)
     for state in orphaned:
         active_groups.pop(state.group_id, None)
-        log.info("📸 Removed orphaned group %d (alerts cleared)", state.group_id)
 
 
 def _group_cities_by_status(city_by_status: dict[str, str]) -> dict[str, set[str]]:
@@ -1361,20 +1356,24 @@ def main():
     last_screenshot_time = 0.0
     sliding_window_end = 0.0
     pending_screenshot = False
-    # Track (key, status) pairs so status upgrades (e.g. pre_alert → alert) are detected
-    previous_primary_pairs: set[tuple[str, str]] = set()
+    
+    # Separate state for real vs test
+    previous_primary_pairs_real: set[tuple[str, str]] = set()
+    previous_primary_pairs_test: set[tuple[str, str]] = set()
+    
     latest_snapshot: dict = {}
     snapshot_lock = threading.Lock()
-    # Per-geographic-group state: group_id -> GroupState
-    active_groups: dict[int, GroupState] = {}
+    
+    # Separate group states
+    active_groups_real: dict[int, GroupState] = {}
+    active_groups_test: dict[int, GroupState] = {}
+    
     centroids = _load_centroids()
 
     def on_alerts_change(event):
         """Firebase listener callback — fires on every change to active_alerts."""
-        nonlocal pending_screenshot, sliding_window_end, previous_primary_pairs, latest_snapshot
+        nonlocal pending_screenshot, sliding_window_end, previous_primary_pairs_real, previous_primary_pairs_test, latest_snapshot
 
-        # Always fetch full snapshot to avoid issues with Firebase patch events
-        # at path "/" that only contain changed entries.
         data = event.data
         if event.path != "/" or data is None or getattr(event, "event_type", None) == "patch":
             ref = db.reference(FIREBASE_NODE)
@@ -1383,34 +1382,39 @@ def main():
         with snapshot_lock:
             latest_snapshot = data if isinstance(data, dict) else {}
 
-        # Build (key, status) pairs so we detect both new alerts AND status upgrades
-        current_primary_pairs = set()
+        current_primary_pairs_real = set()
+        current_primary_pairs_test = set()
+        
         if isinstance(data, dict):
             for key, alert in data.items():
                 if isinstance(alert, dict):
                     status = alert.get("status", "")
                     if _is_primary_alert(status):
-                        # Skip test alerts unless TEST_CHANNEL_ID is configured
-                        if not TEST_CHANNEL_ID and (alert.get("is_test") or alert.get("test") or alert.get("isTest")):
-                            continue
-                        current_primary_pairs.add((key, status))
+                        is_test = alert.get("is_test") or alert.get("test") or alert.get("isTest")
+                        if is_test:
+                            current_primary_pairs_test.add((key, status))
+                        else:
+                            current_primary_pairs_real.add((key, status))
 
-        new_or_changed = current_primary_pairs - previous_primary_pairs
+        new_real = current_primary_pairs_real - previous_primary_pairs_real
+        new_test = current_primary_pairs_test - previous_primary_pairs_test
 
-        # When all primary alerts clear, reset group states so the next alert
-        # wave is treated as brand-new (creates fresh messages, not stale edits).
-        if not current_primary_pairs and previous_primary_pairs:
-            active_groups.clear()
-            log.info("📸 All primary alerts cleared — group states reset")
+        if not current_primary_pairs_real and previous_primary_pairs_real:
+            active_groups_real.clear()
+            log.info("📸 Real alerts cleared — real group states reset")
+        if not current_primary_pairs_test and previous_primary_pairs_test:
+            active_groups_test.clear()
+            log.info("📸 Test alerts cleared — test group states reset")
 
-        previous_primary_pairs = current_primary_pairs
+        previous_primary_pairs_real = current_primary_pairs_real
+        previous_primary_pairs_test = current_primary_pairs_test
 
-        if new_or_changed:
+        if new_real or (new_test and TEST_CHANNEL_ID):
             now = time.time()
             sliding_window_end = now + BATCH_DELAY
             pending_screenshot = True
-            log.info("🔔 %d new/upgraded primary alert(s) detected! Sliding window set to %ds.",
-                     len(new_or_changed), BATCH_DELAY)
+            log.info("🔔 New alerts detected (Real: %d, Test: %d)! Sliding window set to %ds.",
+                     len(new_real), len(new_test), BATCH_DELAY)
 
     # Start Firebase listener
     log.info("👂 Listening for alert changes on Firebase: %s", FIREBASE_NODE)
@@ -1423,7 +1427,7 @@ def main():
     log.info("📸 Broadcast config: cooldown=%ds batch_delay=%ds edit_window=%ds cluster_km=%.0f",
              SCREENSHOT_COOLDOWN, BATCH_DELAY, EDIT_WINDOW, GEO_CLUSTER_KM)
     if TEST_CHANNEL_ID:
-        log.warning("TEST MODE active: routing all messages (incl. is_test alerts) to %s only", TEST_CHANNEL_ID)
+        log.info("🔍 Test Channel configured: %s", TEST_CHANNEL_ID)
 
     # Main loop — handles batching and cooldown
     while True:
@@ -1433,41 +1437,30 @@ def main():
 
                 if now >= sliding_window_end:
                     time_since_last = now - last_screenshot_time
-                    # Allow through if cooldown elapsed OR if any group has a live editable message
-                    can_edit = any(gs.message_ids for gs in active_groups.values())
-                    if time_since_last >= SCREENSHOT_COOLDOWN or can_edit:
+                    
+                    # Check if either real or test groups have editable messages
+                    can_edit_real = any(gs.message_ids for gs in active_groups_real.values())
+                    can_edit_test = any(gs.message_ids for gs in active_groups_test.values())
+                    
+                    if time_since_last >= SCREENSHOT_COOLDOWN or can_edit_real or can_edit_test:
                         with snapshot_lock:
                             current_data = dict(latest_snapshot)
 
                         if current_data:
-                            # Filter out test alerts to see if there's anything real to show
-                            # (In test mode, treat is_test alerts as real)
-                            real_alerts = {
-                                k: v for k, v in current_data.items()
-                                if isinstance(v, dict) and (
-                                    TEST_CHANNEL_ID or
-                                    not (v.get("is_test") or v.get("test") or v.get("isTest"))
-                                )
-                            }
-
-                            if not real_alerts:
-                                log.info("📸 No non-test alerts active — skipping screenshot.")
-                                pending_screenshot = False
-                                continue
-
-                            # Clear the flag BEFORE the blocking broadcast so that any new
-                            # alerts arriving during capture/send can re-arm it correctly.
                             pending_screenshot = False
-                            log.info("📸 Cooldown & batch window elapsed — broadcasting for %d alerts",
-                                     len(real_alerts))
+                            log.info("📸 Processing broadcast batch...")
                             try:
-                                broadcast_all_groups(active_groups, current_data, centroids)
+                                # 1. Broadcast Real Alerts to all subscribers
+                                broadcast_all_groups(active_groups_real, current_data, centroids, is_test_run=False)
+                                
+                                # 2. Broadcast Test Alerts to test channel only
+                                if TEST_CHANNEL_ID:
+                                    broadcast_all_groups(active_groups_test, current_data, centroids, is_test_run=True)
+                                
                                 last_screenshot_time = time.time()
                             except Exception as e:
-                                log.error("📸 Screenshot/broadcast failed: %s", e)
-
+                                log.error("📸 Broadcast batch failed: %s", e)
                         else:
-                            log.info("📸 Alerts cleared before screenshot — cancelling.")
                             pending_screenshot = False
                     else:
                         remaining = SCREENSHOT_COOLDOWN - time_since_last
