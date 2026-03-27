@@ -969,19 +969,56 @@ def _compute_group_diff(
 
 # ── Per-Group Broadcast Helpers ──────────────────────────────────────────────
 
-def _capture_raw_screenshot(theme: str = "dark") -> Path | None:
+def _compute_cluster_view(
+    city_names: set[str],
+    centroids: dict[str, tuple[float, float]],
+) -> tuple[float | None, float | None, int | None]:
+    """
+    Compute the best map center (lat, lon) and zoom level for a geographic cluster.
+    Returns (None, None, None) when no centroids are known → caller uses default full-Israel view.
+    """
+    known = [centroids[c] for c in city_names if c in centroids]
+    if not known:
+        return None, None, None
+
+    lats = [p[0] for p in known]
+    lons = [p[1] for p in known]
+    center_lat = (min(lats) + max(lats)) / 2.0
+    center_lon = (min(lons) + max(lons)) / 2.0
+
+    lat_span_km = (max(lats) - min(lats)) * 111.0
+    lon_span_km = (max(lons) - min(lons)) * 111.0 * math.cos(math.radians(center_lat))
+    max_span_km = max(lat_span_km, lon_span_km, 1.0)
+
+    # 50% padding so context around the cluster is visible
+    padded_km = max_span_km * 1.5
+    # At zoom 8 roughly 400 km is visible in a 900 px viewport; each zoom step halves coverage
+    zoom = max(7, min(13, round(8.5 + math.log2(400.0 / padded_km))))
+
+    return center_lat, center_lon, zoom
+
+
+def _capture_raw_screenshot(
+    theme: str = "dark",
+    lat: float | None = None,
+    lon: float | None = None,
+    zoom: int | None = None,
+) -> Path | None:
     """
     Capture one raw (no-overlay) screenshot of the map.
+    When lat/lon/zoom are provided the map is centred on that location.
     In test mode (TEST_CHANNEL_ID set), injects window.__showTestAlerts=true
     into the browser context so the frontend renders is_test alerts — without
     making test alerts visible to real website visitors.
     Returns the raw PNG path, or None on failure.
     """
     try:
+        url = SCREENSHOT_URL
+        if lat is not None and lon is not None and zoom is not None:
+            url += f"&lat={lat:.5f}&lon={lon:.5f}&zoom={zoom}"
         init_script = "window.__showTestAlerts = true;" if TEST_CHANNEL_ID else None
         dummy_path = OUTPUT_DIR / f"dummy_{int(time.time())}.png"
-        _, raw_file = capture_screenshot(SCREENSHOT_URL, dummy_path, theme=theme,
-                                         init_script=init_script)
+        _, raw_file = capture_screenshot(url, dummy_path, theme=theme, init_script=init_script)
         dummy_path.unlink(missing_ok=True)
         return raw_file
     except Exception as e:
@@ -1135,87 +1172,102 @@ def broadcast_all_groups(
     # Match clusters to existing group states
     matched, unmatched_new, orphaned = _match_clusters_to_states(new_clusters, active_groups)
 
-    # Capture raw screenshot once — reused across all groups
-    raw_path = _capture_raw_screenshot(theme)
-    if raw_path is None:
-        return
+    # Process matched clusters — each gets its own screenshot centred on the cluster
+    for ci, (cluster_cities, state) in matched.items():
+        cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
+        new_same, upgraded = _compute_group_diff(cluster_city_by_status, state)
 
-    try:
-        # Process matched clusters
-        for ci, (cluster_cities, state) in matched.items():
-            cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
-            new_same, upgraded = _compute_group_diff(cluster_city_by_status, state)
+        new_snapshot = {s: frozenset(cs) for s, cs in
+                        _group_cities_by_status(cluster_city_by_status).items()}
 
-            new_snapshot = {s: frozenset(cs) for s, cs in
-                            _group_cities_by_status(cluster_city_by_status).items()}
+        if upgraded:
+            # Status upgrades → NEW message for only the upgraded cities
+            upgraded_all: set[str] = set()
+            for cities_set in upgraded.values():
+                upgraded_all.update(cities_set)
 
-            if upgraded:
-                # Status upgrades → NEW message for only the upgraded cities
-                upgraded_all: set[str] = set()
-                for cities_set in upgraded.values():
-                    upgraded_all.update(cities_set)
-
-                caption = _build_caption(alerts_data, city_filter=upgraded_all)
-                log.info("📸 Group %d: status upgrade in %d city/cities → new message",
-                         state.group_id, len(upgraded_all))
+            caption = _build_caption(alerts_data, city_filter=upgraded_all)
+            lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+            log.info("📸 Group %d: status upgrade in %d city/cities → new message (zoom=%s)",
+                     state.group_id, len(upgraded_all), zoom)
+            raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
+            if raw_path:
                 new_ids = _send_group_to_subscribers(caption, raw_path, theme, prev_message_ids=None)
+                raw_path.unlink(missing_ok=True)
+            else:
+                new_ids = {}
 
-                state.city_names = cluster_cities
-                state.last_broadcast_snapshot = new_snapshot
-                state.message_ids = new_ids
-                state.last_broadcast_time = now
+            state.city_names = cluster_cities
+            state.last_broadcast_snapshot = new_snapshot
+            state.message_ids = new_ids
+            state.last_broadcast_time = now
 
-            elif new_same:
-                # New cities at same status → EDIT if within EDIT_WINDOW, else NEW
-                within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids)
-                caption = _build_caption(alerts_data, city_filter=cluster_cities)
+        elif new_same:
+            # New cities at same status → EDIT if within EDIT_WINDOW, else NEW
+            within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids)
+            caption = _build_caption(alerts_data, city_filter=cluster_cities)
+            lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
 
-                if within_edit:
-                    log.info("📸 Group %d: %d new same-status city/cities → edit (%.0fs < %ds)",
-                             state.group_id, len(new_same),
-                             now - state.last_broadcast_time, EDIT_WINDOW)
+            if within_edit:
+                log.info("📸 Group %d: %d new same-status city/cities → edit (%.0fs < %ds, zoom=%s)",
+                         state.group_id, len(new_same),
+                         now - state.last_broadcast_time, EDIT_WINDOW, zoom)
+                raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
+                if raw_path:
                     new_ids = _send_group_to_subscribers(caption, raw_path, theme,
                                                          prev_message_ids=state.message_ids)
+                    raw_path.unlink(missing_ok=True)
                 else:
-                    log.info("📸 Group %d: %d new same-status city/cities → new message",
-                             state.group_id, len(new_same))
+                    new_ids = {}
+            else:
+                log.info("📸 Group %d: %d new same-status city/cities → new message (zoom=%s)",
+                         state.group_id, len(new_same), zoom)
+                raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
+                if raw_path:
                     new_ids = _send_group_to_subscribers(caption, raw_path, theme,
                                                          prev_message_ids=None)
+                    raw_path.unlink(missing_ok=True)
+                else:
+                    new_ids = {}
 
-                state.city_names = cluster_cities
-                state.last_broadcast_snapshot = new_snapshot
-                state.message_ids = new_ids
-                state.last_broadcast_time = now
+            state.city_names = cluster_cities
+            state.last_broadcast_snapshot = new_snapshot
+            state.message_ids = new_ids
+            state.last_broadcast_time = now
 
-            else:
-                # No actionable change — update city_names in case cluster shape shifted
-                state.city_names = cluster_cities
+        else:
+            # No actionable change — update city_names in case cluster shape shifted
+            state.city_names = cluster_cities
 
-        # Process brand-new clusters
-        for cluster_cities in unmatched_new:
-            cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
-            caption = _build_caption(alerts_data, city_filter=cluster_cities)
-            log.info("📸 New geographic group of %d city/cities → new message", len(cluster_cities))
+    # Process brand-new clusters
+    for cluster_cities in unmatched_new:
+        cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
+        caption = _build_caption(alerts_data, city_filter=cluster_cities)
+        lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+        log.info("📸 New geographic group of %d city/cities → new message (zoom=%s)",
+                 len(cluster_cities), zoom)
+        raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
+        if raw_path:
             new_ids = _send_group_to_subscribers(caption, raw_path, theme, prev_message_ids=None)
+            raw_path.unlink(missing_ok=True)
+        else:
+            new_ids = {}
 
-            new_snapshot = {s: frozenset(cs) for s, cs in
-                            _group_cities_by_status(cluster_city_by_status).items()}
-            group_id = next(_group_id_counter)
-            active_groups[group_id] = GroupState(
-                group_id=group_id,
-                city_names=cluster_cities,
-                last_broadcast_snapshot=new_snapshot,
-                message_ids=new_ids,
-                last_broadcast_time=now,
-            )
+        new_snapshot = {s: frozenset(cs) for s, cs in
+                        _group_cities_by_status(cluster_city_by_status).items()}
+        group_id = next(_group_id_counter)
+        active_groups[group_id] = GroupState(
+            group_id=group_id,
+            city_names=cluster_cities,
+            last_broadcast_snapshot=new_snapshot,
+            message_ids=new_ids,
+            last_broadcast_time=now,
+        )
 
-        # Remove orphaned states (alerts cleared for those areas)
-        for state in orphaned:
-            active_groups.pop(state.group_id, None)
-            log.info("📸 Removed orphaned group %d (alerts cleared)", state.group_id)
-
-    finally:
-        raw_path.unlink(missing_ok=True)
+    # Remove orphaned states (alerts cleared for those areas)
+    for state in orphaned:
+        active_groups.pop(state.group_id, None)
+        log.info("📸 Removed orphaned group %d (alerts cleared)", state.group_id)
 
 
 def _group_cities_by_status(city_by_status: dict[str, str]) -> dict[str, set[str]]:
