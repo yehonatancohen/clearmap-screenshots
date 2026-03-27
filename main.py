@@ -220,12 +220,8 @@ def capture_screenshot(url: str, output_path: Path, theme: str = "dark",
                 page.screenshot(path=str(raw_path), full_page=False)
                 browser.close()
 
-            # Overlay logo + legend using Pillow (lightweight, no browser needed)
-            overlay_screenshot(raw_path, output_path, size=size, theme=theme, 
-                               custom_logo_path=custom_logo_path)
-            
-            log.info("📸 Screenshot saved: %s (%.1f KB)", output_path, output_path.stat().st_size / 1024)
-            return output_path, raw_path
+            log.info("📸 Raw screenshot captured: %s", raw_path.name)
+            return raw_path
 
         except Exception as e:
             log.error("📸 Attempt %d failed: %s", attempt, e)
@@ -1086,16 +1082,13 @@ def _compute_cluster_view(
 ) -> tuple[float | None, float | None, int | None]:
     """
     Compute the best map center (lat, lon) and zoom level for a geographic cluster.
-    Uses actual polygon boundary points so the screenshot bounding box covers the
-    full outer impact ellipse (which is fitted to those same polygon boundaries).
-    Returns (None, None, None) when no centroids are known → caller uses default full-Israel view.
+    Centers on the calculated impact ellipse ring to ensure it fits perfectly.
     """
     known = [centroids[c] for c in city_names if c in centroids]
     if not known:
         return None, None, None
 
-    # Use all polygon boundary points so the bbox covers the full outer ellipse.
-    # Fall back to centroids if polygon data is unavailable.
+    # Load polygon points for fitting the ellipse
     polygon_points = _load_polygon_points()
     all_points: list[tuple[float, float]] = []
     for c in city_names:
@@ -1105,18 +1098,32 @@ def _compute_cluster_view(
     if not all_points:
         all_points = known
 
-    lats = [p[0] for p in all_points]
-    lons = [p[1] for p in all_points]
-    center_lat = (min(lats) + max(lats)) / 2.0
-    center_lon = (min(lons) + max(lons)) / 2.0
+    # 1. Compute Center (Centroid)
+    c_lat, c_lon = _compute_centroid(known)
 
-    lat_span_km = (max(lats) - min(lats)) * 111.0
-    lon_span_km = (max(lons) - min(lons)) * 111.0 * math.cos(math.radians(center_lat))
+    # 2. Compute Orientation (PCA)
+    angle = _pca_angle(known)
+
+    # 3. Compute Extents
+    semi_major, semi_minor = _extents_along_angle(all_points, c_lat, c_lon, angle)
+
+    # 4. Generate Ellipse Ring Points
+    ring = _generate_ellipse_ring(c_lat, c_lon, semi_major, semi_minor, angle)
+
+    # 5. Compute View Bounds from Ring
+    rlats = [p[0] for p in ring]
+    rlons = [p[1] for p in ring]
+    
+    # Recalculate center based on ring bounds for better alignment
+    center_lat = (min(rlats) + max(rlats)) / 2.0
+    center_lon = (min(rlons) + max(rlons)) / 2.0
+
+    lat_span_km = (max(rlats) - min(rlats)) * 111.0
+    lon_span_km = (max(rlons) - min(rlons)) * 111.0 * math.cos(math.radians(center_lat))
     max_span_km = max(lat_span_km, lon_span_km, 1.0)
 
-    # 60% padding for more context around the cluster
+    # Use 60% padding to ensure the ellipse ring + shadows are fully visible
     padded_km = max_span_km * 1.6
-    # Base zoom 8.3 to ensure all alerts fit comfortably
     zoom = max(7, min(13, round(8.3 + math.log2(400.0 / padded_km))))
 
     return center_lat, center_lon, zoom
@@ -1130,11 +1137,6 @@ def _capture_raw_screenshot(
 ) -> Path | None:
     """
     Capture one raw (no-overlay) screenshot of the map.
-    When lat/lon/zoom are provided the map is centred on that location.
-    In test mode (TEST_CHANNEL_ID set), injects window.__showTestAlerts=true
-    into the browser context so the frontend renders is_test alerts — without
-    making test alerts visible to real website visitors.
-    Returns the raw PNG path, or None on failure.
     """
     try:
         url = SCREENSHOT_URL
@@ -1142,9 +1144,11 @@ def _capture_raw_screenshot(
             sep = "&" if "?" in url else "?"
             url += f"{sep}lat={lat:.5f}&lon={lon:.5f}&zoom={zoom}"
         init_script = "window.__showTestAlerts = true;" if TEST_CHANNEL_ID else None
+        
+        # capture_screenshot now returns only the raw Path
         dummy_path = OUTPUT_DIR / f"dummy_{int(time.time())}.png"
-        _, raw_file = capture_screenshot(url, dummy_path, theme=theme, init_script=init_script)
-        dummy_path.unlink(missing_ok=True)
+        raw_file = capture_screenshot(url, dummy_path, theme=theme, init_script=init_script)
+        
         return raw_file
     except Exception as e:
         log.error("Screenshot capture failed: %s", e)
@@ -1303,50 +1307,51 @@ def broadcast_all_groups(
     matched, unmatched_new, orphaned = _match_clusters_to_states(new_clusters, active_groups)
 
     # Process matched clusters
+    # Status rank: higher number = higher priority
+    _STATUS_RANK: dict[str, int] = {"pre_alert": 1, "alert": 2, "uav": 2, "terrorist": 2}
+
     for ci, (cluster_cities, state) in matched.items():
         cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
-        new_same, upgraded = _compute_group_diff(cluster_city_by_status, state)
-
-        if not new_same and not upgraded:
-            state.city_names = cluster_cities
-            continue
-
         new_snapshot = {s: frozenset(cs) for s, cs in
                         _group_cities_by_status(cluster_city_by_status).items()}
 
-        changed_cities = new_same.copy()
-        for upgraded_set in upgraded.values():
-            changed_cities.update(upgraded_set)
+        # Compute what changed relative to the last broadcast
+        old_all_cities = {c for cs in state.last_broadcast_snapshot.values() for c in cs}
+        new_all_cities = set(cluster_city_by_status.keys())
+        cities_added = new_all_cities - old_all_cities
 
-        is_upgrade = len(upgraded) > 0
-        within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids) and not is_upgrade
+        old_top = max(state.last_broadcast_snapshot.keys(),
+                      key=lambda s: _STATUS_RANK.get(s, 0), default="")
+        new_top = max(cluster_city_by_status.values(),
+                      key=lambda s: _STATUS_RANK.get(s, 0), default="")
+        status_escalated = _STATUS_RANK.get(new_top, 0) > _STATUS_RANK.get(old_top, 0)
 
-        if within_edit:
-            lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
-            log.info("📸 Group %d (%s): %d changed → edit", state.group_id, "TEST" if is_test_run else "REAL", len(changed_cities))
-            caption = _build_caption(alerts_data, city_filter=cluster_cities)
-            raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
-            if raw_path:
+        # Only act when cities are added or status escalates.
+        # If the only change is cities leaving (transitioning to after_alert/clear),
+        # do nothing — the existing Telegram message stays as-is.
+        if not cities_added and not status_escalated:
+            state.city_names = cluster_cities
+            continue
+
+        do_edit = bool(state.message_ids) and not status_escalated
+
+        lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+        caption = _build_caption(alerts_data, city_filter=cluster_cities)
+        raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
+        if raw_path:
+            if do_edit:
+                log.info("📸 Group %d (%s): same status → edit", state.group_id, "TEST" if is_test_run else "REAL")
                 new_ids = _send_group_to_subscribers(caption, raw_path, theme,
                                                      prev_message_ids=state.message_ids,
                                                      target_subscribers=target_subscribers)
-                raw_path.unlink(missing_ok=True)
-                state.message_ids = new_ids
-        else:
-            focus_cities = changed_cities
-            lat, lon, zoom = _compute_cluster_view(focus_cities, centroids)
-            if lat is None:
-                lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
-
-            log.info("📸 Group %d (%s): %d changed → new message", state.group_id, "TEST" if is_test_run else "REAL", len(changed_cities))
-            caption = _build_caption(alerts_data, city_filter=cluster_cities)
-            raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
-            if raw_path:
-                new_ids = _send_group_to_subscribers(caption, raw_path, theme, 
+            else:
+                log.info("📸 Group %d (%s): status escalated %s→%s → new message",
+                         state.group_id, "TEST" if is_test_run else "REAL", old_top, new_top)
+                new_ids = _send_group_to_subscribers(caption, raw_path, theme,
                                                      prev_message_ids=None,
                                                      target_subscribers=target_subscribers)
-                raw_path.unlink(missing_ok=True)
-                state.message_ids = new_ids
+            raw_path.unlink(missing_ok=True)
+            state.message_ids = new_ids
 
         state.city_names = cluster_cities
         state.last_broadcast_snapshot = new_snapshot
@@ -1503,6 +1508,10 @@ def main():
                                     broadcast_all_groups(active_groups_test, current_data, centroids, is_test_run=True)
                                 
                                 last_screenshot_time = time.time()
+                                # Reset sliding window so any events that fired
+                                # during the broadcast are re-batched, not fired
+                                # immediately on the next loop tick.
+                                sliding_window_end = last_screenshot_time + BATCH_DELAY
                             except Exception as e:
                                 log.error("📸 Broadcast batch failed: %s", e)
                         else:
