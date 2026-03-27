@@ -1069,10 +1069,10 @@ def _compute_cluster_view(
     lon_span_km = (max(lons) - min(lons)) * 111.0 * math.cos(math.radians(center_lat))
     max_span_km = max(lat_span_km, lon_span_km, 1.0)
 
-    # 20% padding instead of 50%
-    padded_km = max_span_km * 1.2
-    # Base zoom 9.0 instead of 8.5 for tighter fit
-    zoom = max(7, min(13, round(9.0 + math.log2(400.0 / padded_km))))
+    # 40% padding for a better context
+    padded_km = max_span_km * 1.4
+    # Base zoom 8.6 instead of 9.0 for a more balanced fit
+    zoom = max(7, min(13, round(8.6 + math.log2(400.0 / padded_km))))
 
     return center_lat, center_lon, zoom
 
@@ -1259,77 +1259,55 @@ def broadcast_all_groups(
         cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
         new_same, upgraded = _compute_group_diff(cluster_city_by_status, state)
 
+        if not new_same and not upgraded:
+            # No actionable change — update city_names in case cluster shape shifted
+            state.city_names = cluster_cities
+            continue
+
         new_snapshot = {s: frozenset(cs) for s, cs in
                         _group_cities_by_status(cluster_city_by_status).items()}
 
-        if upgraded:
-            # Status upgrades → NEW message for only the upgraded cities
-            upgraded_all: set[str] = set()
-            for cities_set in upgraded.values():
-                upgraded_all.update(cities_set)
+        # Combine all changed cities (newly alerted or upgraded from pre_alert)
+        changed_cities = new_same.copy()
+        for upgraded_set in upgraded.values():
+            changed_cities.update(upgraded_set)
 
-            caption = _build_caption(alerts_data, city_filter=upgraded_all)
-            # Focus view on the upgraded cities specifically
-            lat, lon, zoom = _compute_cluster_view(upgraded_all, centroids)
+        within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids)
+
+        if within_edit:
+            # EDIT existing message: Focus on the WHOLE cluster to provide context
+            lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+            log.info("📸 Group %d: %d changed city/cities → edit (%.0fs < %ds, zoom=%s)",
+                     state.group_id, len(changed_cities),
+                     now - state.last_broadcast_time, EDIT_WINDOW, zoom)
+            caption = _build_caption(alerts_data, city_filter=cluster_cities)
+            raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
+            if raw_path:
+                new_ids = _send_group_to_subscribers(caption, raw_path, theme,
+                                                     prev_message_ids=state.message_ids)
+                raw_path.unlink(missing_ok=True)
+                state.message_ids = new_ids
+        else:
+            # NEW message: Focus on the NEW activity specifically
+            lat, lon, zoom = _compute_cluster_view(changed_cities, centroids)
             if lat is None:
                 lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
 
-            log.info("📸 Group %d: status upgrade in %d city/cities → new message (zoom=%s)",
-                     state.group_id, len(upgraded_all), zoom)
+            log.info("📸 Group %d: %d changed city/cities → new message (zoom=%s)",
+                     state.group_id, len(changed_cities), zoom)
+            # For new messages, caption shows the relevant subset (or whole cluster if not upgrade)
+            caption_filter = changed_cities if upgraded else cluster_cities
+            caption = _build_caption(alerts_data, city_filter=caption_filter)
+            
             raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
             if raw_path:
                 new_ids = _send_group_to_subscribers(caption, raw_path, theme, prev_message_ids=None)
                 raw_path.unlink(missing_ok=True)
-            else:
-                new_ids = {}
+                state.message_ids = new_ids
 
-            state.city_names = cluster_cities
-            state.last_broadcast_snapshot = new_snapshot
-            state.message_ids = new_ids
-            state.last_broadcast_time = now
-
-        elif new_same:
-            # New cities at same status → EDIT if within EDIT_WINDOW, else NEW
-            within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids)
-            caption = _build_caption(alerts_data, city_filter=cluster_cities)
-
-            if within_edit:
-                # When editing an existing message, show the whole cluster
-                lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
-                log.info("📸 Group %d: %d new same-status city/cities → edit (%.0fs < %ds, zoom=%s)",
-                         state.group_id, len(new_same),
-                         now - state.last_broadcast_time, EDIT_WINDOW, zoom)
-                raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
-                if raw_path:
-                    new_ids = _send_group_to_subscribers(caption, raw_path, theme,
-                                                         prev_message_ids=state.message_ids)
-                    raw_path.unlink(missing_ok=True)
-                else:
-                    new_ids = {}
-            else:
-                # Sending a NEW message for an existing group → Focus on the new activity
-                lat, lon, zoom = _compute_cluster_view(new_same, centroids)
-                if lat is None:
-                    lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
-
-                log.info("📸 Group %d: %d new same-status city/cities → new message (zoom=%s)",
-                         state.group_id, len(new_same), zoom)
-                raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
-                if raw_path:
-                    new_ids = _send_group_to_subscribers(caption, raw_path, theme,
-                                                         prev_message_ids=None)
-                    raw_path.unlink(missing_ok=True)
-                else:
-                    new_ids = {}
-
-            state.city_names = cluster_cities
-            state.last_broadcast_snapshot = new_snapshot
-            state.message_ids = new_ids
-            state.last_broadcast_time = now
-
-        else:
-            # No actionable change — update city_names in case cluster shape shifted
-            state.city_names = cluster_cities
+        state.city_names = cluster_cities
+        state.last_broadcast_snapshot = new_snapshot
+        state.last_broadcast_time = now
 
     # Process brand-new clusters
     for cluster_cities in unmatched_new:
