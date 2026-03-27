@@ -15,7 +15,7 @@ RUN playwright install --with-deps chromium
 RUN apt-get update && apt-get install -y dumb-init && rm -rf /var/lib/apt/lists/*
 
 # Copy application code
-COPY main.py screenshot_overlay.py ./
+COPY main.py screenshot_overlay.py polygons.json ./
 
 # Copy logo assets + font for overlays
 COPY public/ ./public/

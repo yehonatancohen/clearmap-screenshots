@@ -67,8 +67,8 @@ BATCH_DELAY = int(os.environ.get("SCREENSHOT_BATCH_DELAY", "") or _cfg.get("SCRE
 # If new alerts arrive within this many seconds of the last broadcast,
 # edit the existing Telegram message instead of sending a new one.
 EDIT_WINDOW = int(os.environ.get("SCREENSHOT_EDIT_WINDOW", "") or _cfg.get("SCREENSHOT_EDIT_WINDOW", "300"))
-GEO_CLUSTER_KM = float(os.environ.get("GEO_CLUSTER_KM", "") or _cfg.get("GEO_CLUSTER_KM", "50"))
-POLYGONS_FILE_DEFAULT = Path(__file__).parent.parent / "clear-map-backend" / "polygons.json"
+GEO_CLUSTER_KM = float(os.environ.get("GEO_CLUSTER_KM", "") or _cfg.get("GEO_CLUSTER_KM", "30"))
+POLYGONS_FILE_DEFAULT = Path(__file__).parent / "polygons.json"
 FIREBASE_DB_URL = "https://clear-map-f20d0-default-rtdb.europe-west1.firebasedatabase.app/"
 FIREBASE_NODE = "/public_state/active_alerts"
 FIREBASE_SUBSCRIBERS = "/public_state/subscribers"
@@ -1189,7 +1189,11 @@ def broadcast_all_groups(
                 upgraded_all.update(cities_set)
 
             caption = _build_caption(alerts_data, city_filter=upgraded_all)
-            lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+            # Focus view on the upgraded cities specifically
+            lat, lon, zoom = _compute_cluster_view(upgraded_all, centroids)
+            if lat is None:
+                lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+
             log.info("📸 Group %d: status upgrade in %d city/cities → new message (zoom=%s)",
                      state.group_id, len(upgraded_all), zoom)
             raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
@@ -1208,9 +1212,10 @@ def broadcast_all_groups(
             # New cities at same status → EDIT if within EDIT_WINDOW, else NEW
             within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids)
             caption = _build_caption(alerts_data, city_filter=cluster_cities)
-            lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
 
             if within_edit:
+                # When editing an existing message, show the whole cluster
+                lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
                 log.info("📸 Group %d: %d new same-status city/cities → edit (%.0fs < %ds, zoom=%s)",
                          state.group_id, len(new_same),
                          now - state.last_broadcast_time, EDIT_WINDOW, zoom)
@@ -1222,6 +1227,11 @@ def broadcast_all_groups(
                 else:
                     new_ids = {}
             else:
+                # Sending a NEW message for an existing group → Focus on the new activity
+                lat, lon, zoom = _compute_cluster_view(new_same, centroids)
+                if lat is None:
+                    lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+
                 log.info("📸 Group %d: %d new same-status city/cities → new message (zoom=%s)",
                          state.group_id, len(new_same), zoom)
                 raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
