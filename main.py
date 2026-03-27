@@ -912,6 +912,38 @@ def _load_centroids() -> dict[str, tuple[float, float]]:
         return {}
 
 
+_polygon_points_cache: dict[str, list[tuple[float, float]]] | None = None
+
+
+def _load_polygon_points() -> dict[str, list[tuple[float, float]]]:
+    """
+    Load city polygon boundary points from polygons.json.
+    Returns dict[city_name_he -> list of (lat, lon) points].
+    Used by _compute_cluster_view so the screenshot bounding box covers
+    the full outer impact ellipse (which is fitted to polygon boundaries).
+    """
+    global _polygon_points_cache
+    if _polygon_points_cache is not None:
+        return _polygon_points_cache
+    polygons_path = Path(os.environ.get("POLYGONS_FILE", "") or str(POLYGONS_FILE_DEFAULT))
+    if not polygons_path.exists():
+        _polygon_points_cache = {}
+        return _polygon_points_cache
+    try:
+        with open(polygons_path, encoding="utf-8") as f:
+            data = json.load(f)
+        _polygon_points_cache = {
+            name: [(float(p[0]), float(p[1])) for p in entry["polygon"]]
+            for name, entry in data.items()
+            if entry.get("polygon")
+        }
+        return _polygon_points_cache
+    except Exception as e:
+        log.warning("Failed to load polygon boundary points: %s", e)
+        _polygon_points_cache = {}
+        return _polygon_points_cache
+
+
 def _cluster_cities(
     city_names: list[str],
     centroids: dict[str, tuple[float, float]],
@@ -1054,14 +1086,27 @@ def _compute_cluster_view(
 ) -> tuple[float | None, float | None, int | None]:
     """
     Compute the best map center (lat, lon) and zoom level for a geographic cluster.
+    Uses actual polygon boundary points so the screenshot bounding box covers the
+    full outer impact ellipse (which is fitted to those same polygon boundaries).
     Returns (None, None, None) when no centroids are known → caller uses default full-Israel view.
     """
     known = [centroids[c] for c in city_names if c in centroids]
     if not known:
         return None, None, None
 
-    lats = [p[0] for p in known]
-    lons = [p[1] for p in known]
+    # Use all polygon boundary points so the bbox covers the full outer ellipse.
+    # Fall back to centroids if polygon data is unavailable.
+    polygon_points = _load_polygon_points()
+    all_points: list[tuple[float, float]] = []
+    for c in city_names:
+        pts = polygon_points.get(c)
+        if pts:
+            all_points.extend(pts)
+    if not all_points:
+        all_points = known
+
+    lats = [p[0] for p in all_points]
+    lons = [p[1] for p in all_points]
     center_lat = (min(lats) + max(lats)) / 2.0
     center_lon = (min(lons) + max(lons)) / 2.0
 
