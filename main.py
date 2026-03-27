@@ -295,8 +295,8 @@ def _build_caption(alerts_data: dict, city_filter: set[str] | None = None) -> st
     for _key, alert in alerts_data.items():
         if not isinstance(alert, dict):
             continue
-        # Skip test alerts
-        if alert.get("is_test") or alert.get("test") or alert.get("isTest"):
+        # Skip test alerts unless TEST_CHANNEL_ID is configured
+        if not TEST_CHANNEL_ID and (alert.get("is_test") or alert.get("test") or alert.get("isTest")):
             continue
         city_he = alert.get("city_name_he", "")
         if city_filter is not None and city_he not in city_filter:
