@@ -1168,6 +1168,8 @@ def broadcast_all_groups(
     # Cluster active cities geographically
     new_clusters = _cluster_cities(list(city_by_status.keys()), centroids)
     log.info("📸 %d alert cities → %d geographic cluster(s)", len(city_by_status), len(new_clusters))
+    for i, c in enumerate(new_clusters):
+        log.info("  Cluster %d (%d cities): %s", i + 1, len(c), ", ".join(sorted(c)))
 
     # Match clusters to existing group states
     matched, unmatched_new, orphaned = _match_clusters_to_states(new_clusters, active_groups)
@@ -1326,6 +1328,13 @@ def main():
                         current_primary_pairs.add((key, status))
 
         new_or_changed = current_primary_pairs - previous_primary_pairs
+
+        # When all primary alerts clear, reset group states so the next alert
+        # wave is treated as brand-new (creates fresh messages, not stale edits).
+        if not current_primary_pairs and previous_primary_pairs:
+            active_groups.clear()
+            log.info("📸 All primary alerts cleared — group states reset")
+
         previous_primary_pairs = current_primary_pairs
 
         if new_or_changed:
