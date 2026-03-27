@@ -60,7 +60,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("CLEARMAP_BOT_TOKEN", "") or _cfg.get("CLEAR
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "") or _cfg.get("TELEGRAM_CHANNEL_ID", "-1003879479829")
 # When set, routes ALL messages (including is_test alerts) only to this channel.
 # Use for end-to-end testing without hitting real subscribers.
-TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "-5197151796") or _cfg.get("TEST_CHANNEL_ID", "-5197151796")
+TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "") or _cfg.get("TEST_CHANNEL_ID", "")
 SCREENSHOT_URL = os.environ.get("SCREENSHOT_URL", "") or _cfg.get("SCREENSHOT_URL", "https://www.clearmap.co.il/broadcast?uav=true&ellipse=true&theme=dark")
 SCREENSHOT_COOLDOWN = int(os.environ.get("SCREENSHOT_COOLDOWN", "") or _cfg.get("SCREENSHOT_COOLDOWN", "120"))
 BATCH_DELAY = int(os.environ.get("SCREENSHOT_BATCH_DELAY", "") or _cfg.get("SCREENSHOT_BATCH_DELAY", "10"))
@@ -642,6 +642,38 @@ def telegram_listener():
         bot.reply_to(message, "✅ הערוץ נרשם במערכת בהצלחה! ניתן לנהל אותו כעת מהצ'אט הפרטי עם הבוט.")
 
     log.info("👂 Telegram private-chat manager started (polling)...")
+
+    # Startup sync: Check existing subscribers in Firebase and verify bot still has access.
+    # Also provides a way to 'recover' if Firebase was cleared but bot is still in channels.
+    def sync_subscribers():
+        log.info("🔄 Syncing subscribers...")
+        subs = get_subscribers_data()
+        for chat_id, data in subs.items():
+            try:
+                chat = bot.get_chat(chat_id)
+                member = bot.get_chat_member(chat_id, bot.get_me().id)
+                if member.status not in ("administrator", "member", "creator"):
+                    log.warning("   ⚠️ Bot no longer in %s (%s) — removing", chat_id, data.get("title"))
+                    remove_subscriber(chat_id)
+                else:
+                    # Update title if it changed
+                    new_title = chat.title or chat.first_name or "Chat"
+                    if new_title != data.get("title"):
+                        add_subscriber(chat_id, new_title)
+            except Exception as e:
+                log.warning("   ⚠️ Could not verify chat %s: %s", chat_id, e)
+        log.info("🔄 Sync complete.")
+
+    # Run sync in a thread after a short delay to ensure polling is ready
+    def delayed_sync():
+        time.sleep(5)
+        try:
+            sync_subscribers()
+        except Exception as e:
+            log.error("Failed to run startup sync: %s", e)
+
+    threading.Thread(target=delayed_sync, daemon=True).start()
+
     while True:
         try:
             # Explicitly allow my_chat_member updates
@@ -990,10 +1022,10 @@ def _compute_cluster_view(
     lon_span_km = (max(lons) - min(lons)) * 111.0 * math.cos(math.radians(center_lat))
     max_span_km = max(lat_span_km, lon_span_km, 1.0)
 
-    # 50% padding so context around the cluster is visible
-    padded_km = max_span_km * 1.5
-    # At zoom 8 roughly 400 km is visible in a 900 px viewport; each zoom step halves coverage
-    zoom = max(7, min(13, round(8.5 + math.log2(400.0 / padded_km))))
+    # 20% padding instead of 50%
+    padded_km = max_span_km * 1.2
+    # Base zoom 9.0 instead of 8.5 for tighter fit
+    zoom = max(7, min(13, round(9.0 + math.log2(400.0 / padded_km))))
 
     return center_lat, center_lon, zoom
 
@@ -1015,7 +1047,8 @@ def _capture_raw_screenshot(
     try:
         url = SCREENSHOT_URL
         if lat is not None and lon is not None and zoom is not None:
-            url += f"&lat={lat:.5f}&lon={lon:.5f}&zoom={zoom}"
+            sep = "&" if "?" in url else "?"
+            url += f"{sep}lat={lat:.5f}&lon={lon:.5f}&zoom={zoom}"
         init_script = "window.__showTestAlerts = true;" if TEST_CHANNEL_ID else None
         dummy_path = OUTPUT_DIR / f"dummy_{int(time.time())}.png"
         _, raw_file = capture_screenshot(url, dummy_path, theme=theme, init_script=init_script)
