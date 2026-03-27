@@ -16,14 +16,17 @@ One-time setup: playwright install chromium
 """
 
 import base64
+import itertools
 import json
 import logging
+import math
 import os
 import sys
 import time
 import shutil
 import threading
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -55,12 +58,17 @@ _cfg = _load_config_env()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("CLEARMAP_BOT_TOKEN", "") or _cfg.get("CLEARMAP_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "") or _cfg.get("TELEGRAM_CHANNEL_ID", "-1003879479829")
+# When set, routes ALL messages (including is_test alerts) only to this channel.
+# Use for end-to-end testing without hitting real subscribers.
+TEST_CHANNEL_ID = os.environ.get("TEST_CHANNEL_ID", "-5197151796") or _cfg.get("TEST_CHANNEL_ID", "-5197151796")
 SCREENSHOT_URL = os.environ.get("SCREENSHOT_URL", "") or _cfg.get("SCREENSHOT_URL", "https://www.clearmap.co.il/broadcast?uav=true&ellipse=true&theme=dark")
 SCREENSHOT_COOLDOWN = int(os.environ.get("SCREENSHOT_COOLDOWN", "") or _cfg.get("SCREENSHOT_COOLDOWN", "120"))
 BATCH_DELAY = int(os.environ.get("SCREENSHOT_BATCH_DELAY", "") or _cfg.get("SCREENSHOT_BATCH_DELAY", "10"))
 # If new alerts arrive within this many seconds of the last broadcast,
 # edit the existing Telegram message instead of sending a new one.
 EDIT_WINDOW = int(os.environ.get("SCREENSHOT_EDIT_WINDOW", "") or _cfg.get("SCREENSHOT_EDIT_WINDOW", "300"))
+GEO_CLUSTER_KM = float(os.environ.get("GEO_CLUSTER_KM", "") or _cfg.get("GEO_CLUSTER_KM", "50"))
+POLYGONS_FILE_DEFAULT = Path(__file__).parent.parent / "clear-map-backend" / "polygons.json"
 FIREBASE_DB_URL = "https://clear-map-f20d0-default-rtdb.europe-west1.firebasedatabase.app/"
 FIREBASE_NODE = "/public_state/active_alerts"
 FIREBASE_SUBSCRIBERS = "/public_state/subscribers"
@@ -250,9 +258,26 @@ try:
 except ImportError:
     DISTRICT_AREAS = {}
 
+# ── Geographic Group State ───────────────────────────────────────────────────
 
-def _build_caption(alerts_data: dict) -> str:
-    """Build a Hebrew caption from the Firebase active_alerts snapshot."""
+_group_id_counter = itertools.count(1)
+
+
+@dataclass
+class GroupState:
+    group_id: int
+    city_names: set[str]  # current set of city_name_he in this group
+    # status -> frozenset of cities at time of last broadcast (for diff detection)
+    last_broadcast_snapshot: dict[str, frozenset[str]]
+    message_ids: dict[str, int]  # chat_id -> telegram message_id for this group
+    last_broadcast_time: float
+
+
+def _build_caption(alerts_data: dict, city_filter: set[str] | None = None) -> str:
+    """
+    Build a Hebrew caption from the Firebase active_alerts snapshot.
+    If city_filter is provided, only include alerts for those cities.
+    """
     if not alerts_data:
         return "אין התרעות פעילות"
 
@@ -270,8 +295,10 @@ def _build_caption(alerts_data: dict) -> str:
         # Skip test alerts
         if alert.get("is_test") or alert.get("test") or alert.get("isTest"):
             continue
-        status = alert.get("status", "alert")
         city_he = alert.get("city_name_he", "")
+        if city_filter is not None and city_he not in city_filter:
+            continue
+        status = alert.get("status", "alert")
         ts = alert.get("timestamp", 0) / 1000  # JS ms → Python seconds
         groups[status].append((city_he, ts))
 
@@ -757,6 +784,440 @@ def _is_primary_alert(status: str) -> bool:
     return status in ("alert", "uav", "terrorist", "pre_alert")
 
 
+# ── Geographic Clustering ────────────────────────────────────────────────────
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two points in km."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _compute_centroid(polygon_coords: list) -> tuple[float, float]:
+    """Average of all boundary points → (lat, lng)."""
+    n = len(polygon_coords)
+    if n == 0:
+        return (0.0, 0.0)
+    lat_sum = sum(p[0] for p in polygon_coords)
+    lng_sum = sum(p[1] for p in polygon_coords)
+    return (lat_sum / n, lng_sum / n)
+
+
+def _load_centroids() -> dict[str, tuple[float, float]]:
+    """
+    Load city centroids from polygons.json.
+    Returns dict[city_name_he -> (lat, lon)].
+    Falls back to empty dict if file not found (clustering disabled).
+    """
+    polygons_path = Path(os.environ.get("POLYGONS_FILE", "") or str(POLYGONS_FILE_DEFAULT))
+    if not polygons_path.exists():
+        log.warning("polygons.json not found at %s — geo-clustering disabled (all alerts in one group)", polygons_path)
+        return {}
+    try:
+        with open(polygons_path, encoding="utf-8") as f:
+            data = json.load(f)
+        centroids = {
+            name: _compute_centroid(entry["polygon"])
+            for name, entry in data.items()
+            if entry.get("polygon")
+        }
+        log.info("🗺  Loaded centroids for %d cities from %s", len(centroids), polygons_path)
+        return centroids
+    except Exception as e:
+        log.warning("Failed to load polygons.json: %s — geo-clustering disabled", e)
+        return {}
+
+
+def _cluster_cities(
+    city_names: list[str],
+    centroids: dict[str, tuple[float, float]],
+    threshold_km: float = GEO_CLUSTER_KM,
+) -> list[set[str]]:
+    """
+    Partition city_names into geographic clusters using BFS on a proximity graph.
+    Two cities are adjacent if haversine distance <= threshold_km.
+    Cities missing from centroids are each placed in their own singleton cluster.
+    If centroids dict is empty, returns a single cluster containing all cities.
+    """
+    if not city_names:
+        return []
+
+    # Fallback: no centroid data → single group
+    if not centroids:
+        return [set(city_names)]
+
+    known = [c for c in city_names if c in centroids]
+    unknown = [c for c in city_names if c not in centroids]
+
+    # BFS connected-component clustering on known cities
+    visited: set[str] = set()
+    clusters: list[set[str]] = []
+
+    for start in known:
+        if start in visited:
+            continue
+        cluster: set[str] = set()
+        queue = [start]
+        while queue:
+            city = queue.pop()
+            if city in visited:
+                continue
+            visited.add(city)
+            cluster.add(city)
+            lat1, lon1 = centroids[city]
+            for other in known:
+                if other not in visited:
+                    lat2, lon2 = centroids[other]
+                    if _haversine_km(lat1, lon1, lat2, lon2) <= threshold_km:
+                        queue.append(other)
+        clusters.append(cluster)
+
+    # Each unknown city gets its own singleton cluster
+    for city in unknown:
+        clusters.append({city})
+
+    return clusters
+
+
+# ── Group Matching & Diff ────────────────────────────────────────────────────
+
+def _match_clusters_to_states(
+    new_clusters: list[set[str]],
+    existing_states: dict[int, GroupState],
+) -> tuple[dict[int, tuple[set[str], GroupState]], list[set[str]], list[GroupState]]:
+    """
+    Greedy max-overlap matching of new clusters to existing GroupState objects.
+    Each cluster/state is assigned to at most one match.
+
+    Returns:
+      matched:          {cluster_idx -> (cluster_set, state)}
+      unmatched_new:    clusters with no matching existing state (brand new groups)
+      orphaned_states:  states with no matching new cluster (alerts cleared)
+    """
+    # Build all (overlap, cluster_idx, state_id) triples
+    triples: list[tuple[int, int, int]] = []
+    for ci, cluster in enumerate(new_clusters):
+        for sid, state in existing_states.items():
+            overlap = len(cluster & state.city_names)
+            if overlap > 0:
+                triples.append((overlap, ci, sid))
+
+    triples.sort(key=lambda x: x[0], reverse=True)
+
+    assigned_clusters: set[int] = set()
+    assigned_states: set[int] = set()
+    matched: dict[int, tuple[set[str], GroupState]] = {}
+
+    for _overlap, ci, sid in triples:
+        if ci not in assigned_clusters and sid not in assigned_states:
+            matched[ci] = (new_clusters[ci], existing_states[sid])
+            assigned_clusters.add(ci)
+            assigned_states.add(sid)
+
+    unmatched_new = [new_clusters[ci] for ci in range(len(new_clusters)) if ci not in assigned_clusters]
+    orphaned_states = [existing_states[sid] for sid in existing_states if sid not in assigned_states]
+
+    return matched, unmatched_new, orphaned_states
+
+
+_STATUS_PRIORITY: dict[str, int] = {"pre_alert": 1, "alert": 2, "uav": 2, "terrorist": 2}
+
+
+def _compute_group_diff(
+    city_by_status: dict[str, str],
+    state: GroupState,
+) -> tuple[set[str], dict[str, set[str]]]:
+    """
+    Compare current city_by_status against the group's last_broadcast_snapshot.
+
+    Returns:
+      new_same_cities:  cities added at same or new status (not upgraded from pre_alert)
+      upgraded:         dict[new_status -> set[city]] for cities that moved from pre_alert
+                        to a higher-priority status (alert/uav/terrorist)
+    """
+    all_snapshot_cities: set[str] = set()
+    for cities_set in state.last_broadcast_snapshot.values():
+        all_snapshot_cities.update(cities_set)
+
+    new_same: set[str] = set()
+    upgraded: dict[str, set[str]] = defaultdict(set)
+
+    for city, new_status in city_by_status.items():
+        if city not in all_snapshot_cities:
+            # Brand-new city in this group
+            new_same.add(city)
+        else:
+            # City was in snapshot — check if status increased
+            old_status = None
+            for snap_status, snap_cities in state.last_broadcast_snapshot.items():
+                if city in snap_cities:
+                    old_status = snap_status
+                    break
+            if old_status and old_status != new_status:
+                old_prio = _STATUS_PRIORITY.get(old_status, 0)
+                new_prio = _STATUS_PRIORITY.get(new_status, 0)
+                if new_prio > old_prio:
+                    upgraded[new_status].add(city)
+
+    return new_same, dict(upgraded)
+
+
+# ── Per-Group Broadcast Helpers ──────────────────────────────────────────────
+
+def _capture_raw_screenshot(theme: str = "dark") -> Path | None:
+    """
+    Capture one raw (no-overlay) screenshot of the map.
+    Returns the raw PNG path, or None on failure.
+    """
+    try:
+        dummy_path = OUTPUT_DIR / f"dummy_{int(time.time())}.png"
+        _, raw_file = capture_screenshot(SCREENSHOT_URL, dummy_path, theme=theme)
+        dummy_path.unlink(missing_ok=True)
+        return raw_file
+    except Exception as e:
+        log.error("📸 Failed to capture raw screenshot: %s", e)
+        return None
+
+
+def _send_group_to_subscribers(
+    caption: str,
+    raw_path: Path,
+    theme: str = "dark",
+    prev_message_ids: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """
+    Overlay and send (or edit) a screenshot to all subscribers for one geographic group.
+    Reuses a pre-captured raw_path instead of launching a new browser.
+    Returns {chat_id: message_id} for all successful sends/edits.
+    """
+    from screenshot_overlay import overlay_screenshot
+
+    sent_ids: dict[str, int] = {}
+    if prev_message_ids is None:
+        prev_message_ids = {}
+
+    if TEST_CHANNEL_ID:
+        subscribers = [TEST_CHANNEL_ID]
+        log.info("📸 TEST_CHANNEL_ID set — routing to test channel only: %s", TEST_CHANNEL_ID)
+    else:
+        subscribers = get_subscribers()
+        if TELEGRAM_CHANNEL_ID and TELEGRAM_CHANNEL_ID not in subscribers:
+            subscribers.append(TELEGRAM_CHANNEL_ID)
+
+    if not subscribers:
+        log.warning("📸 No subscribers for group broadcast!")
+        return sent_ids
+
+    # Group subscribers by custom logo path
+    logo_groups: dict[Path | None, list[str]] = defaultdict(list)
+    for chat_id in subscribers:
+        found_logo = None
+        for ext in (".png", ".jpg", ".jpeg"):
+            p = CUSTOM_LOGOS_DIR / f"{chat_id}{ext}"
+            if p.exists():
+                found_logo = p
+                break
+        logo_groups[found_logo].append(chat_id)
+
+    is_edit = len(prev_message_ids) > 0
+    log.info("📸 %s group to %d subscriber(s) in %d logo group(s)...",
+             "Editing" if is_edit else "Sending", len(subscribers), len(logo_groups))
+
+    for logo_path, chat_ids in logo_groups.items():
+        group_name = logo_path.name if logo_path else "default"
+        final_path = OUTPUT_DIR / f"broadcast_{group_name}_{int(time.time())}.png"
+
+        try:
+            overlay_screenshot(raw_path, final_path, theme=theme, custom_logo_path=logo_path)
+
+            for chat_id in chat_ids:
+                prev_msg_id = prev_message_ids.get(chat_id)
+                try:
+                    if prev_msg_id:
+                        with open(final_path, "rb") as f:
+                            media_payload = json.dumps({
+                                "type": "photo",
+                                "media": "attach://photo",
+                                "caption": caption,
+                            })
+                            resp = requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageMedia",
+                                data={
+                                    "chat_id": chat_id,
+                                    "message_id": prev_msg_id,
+                                    "media": media_payload,
+                                },
+                                files={"photo": (f"alert_{group_name}.png", f, "image/png")},
+                                timeout=30,
+                            )
+                        if resp.ok:
+                            sent_ids[chat_id] = prev_msg_id
+                            log.info("   ✏️  Edited msg %s in %s (%s)", prev_msg_id, chat_id, group_name)
+                        else:
+                            log.warning("   ⚠️  Edit failed for %s (msg %s): %s — sending new",
+                                        chat_id, prev_msg_id, resp.text[:80])
+                            prev_msg_id = None
+
+                    if not prev_msg_id:
+                        with open(final_path, "rb") as f:
+                            resp = requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                                data={"chat_id": chat_id, "caption": caption},
+                                files={"photo": (f"alert_{group_name}.png", f, "image/png")},
+                                timeout=30,
+                            )
+                        if resp.ok:
+                            msg_id = resp.json().get("result", {}).get("message_id")
+                            if msg_id:
+                                sent_ids[chat_id] = msg_id
+                            log.info("   ✅ Sent to %s (%s)", chat_id, group_name)
+                        elif resp.status_code == 403:
+                            log.warning("   ❌ Forbidden from %s — removing", chat_id)
+                            remove_subscriber(chat_id)
+                        else:
+                            log.error("   ❌ Failed for %s: %s", chat_id, resp.text[:100])
+
+                except Exception as e:
+                    log.error("   ❌ Error sending to %s: %s", chat_id, e)
+
+            final_path.unlink(missing_ok=True)
+        except Exception as e:
+            log.error("📸 Failed to overlay/send for logo group %s: %s", group_name, e)
+
+    return sent_ids
+
+
+def broadcast_all_groups(
+    active_groups: dict[int, GroupState],
+    alerts_data: dict,
+    centroids: dict[str, tuple[float, float]],
+    theme: str = "dark",
+) -> None:
+    """
+    Geographic-aware broadcast: sends separate Telegram messages per contiguous
+    cluster of alerted cities. Edits existing messages when only new cities of the
+    same status join a group; sends new messages on status upgrades or new clusters.
+    Mutates active_groups in-place.
+    """
+    now = time.time()
+
+    # Build city_by_status for all active primary alerts.
+    # In test mode (TEST_CHANNEL_ID set), include is_test alerts too.
+    city_by_status: dict[str, str] = {}
+    for _key, alert in alerts_data.items():
+        if not isinstance(alert, dict):
+            continue
+        if not TEST_CHANNEL_ID and (alert.get("is_test") or alert.get("test") or alert.get("isTest")):
+            continue
+        status = alert.get("status", "")
+        city_he = alert.get("city_name_he", "")
+        if city_he and _is_primary_alert(status):
+            city_by_status[city_he] = status
+
+    if not city_by_status:
+        log.info("📸 No primary alerts — skipping broadcast_all_groups")
+        return
+
+    # Cluster active cities geographically
+    new_clusters = _cluster_cities(list(city_by_status.keys()), centroids)
+    log.info("📸 %d alert cities → %d geographic cluster(s)", len(city_by_status), len(new_clusters))
+
+    # Match clusters to existing group states
+    matched, unmatched_new, orphaned = _match_clusters_to_states(new_clusters, active_groups)
+
+    # Capture raw screenshot once — reused across all groups
+    raw_path = _capture_raw_screenshot(theme)
+    if raw_path is None:
+        return
+
+    try:
+        # Process matched clusters
+        for ci, (cluster_cities, state) in matched.items():
+            cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
+            new_same, upgraded = _compute_group_diff(cluster_city_by_status, state)
+
+            new_snapshot = {s: frozenset(cs) for s, cs in
+                            _group_cities_by_status(cluster_city_by_status).items()}
+
+            if upgraded:
+                # Status upgrades → NEW message for only the upgraded cities
+                upgraded_all: set[str] = set()
+                for cities_set in upgraded.values():
+                    upgraded_all.update(cities_set)
+
+                caption = _build_caption(alerts_data, city_filter=upgraded_all)
+                log.info("📸 Group %d: status upgrade in %d city/cities → new message",
+                         state.group_id, len(upgraded_all))
+                new_ids = _send_group_to_subscribers(caption, raw_path, theme, prev_message_ids=None)
+
+                state.city_names = cluster_cities
+                state.last_broadcast_snapshot = new_snapshot
+                state.message_ids = new_ids
+                state.last_broadcast_time = now
+
+            elif new_same:
+                # New cities at same status → EDIT if within EDIT_WINDOW, else NEW
+                within_edit = (now - state.last_broadcast_time) < EDIT_WINDOW and bool(state.message_ids)
+                caption = _build_caption(alerts_data, city_filter=cluster_cities)
+
+                if within_edit:
+                    log.info("📸 Group %d: %d new same-status city/cities → edit (%.0fs < %ds)",
+                             state.group_id, len(new_same),
+                             now - state.last_broadcast_time, EDIT_WINDOW)
+                    new_ids = _send_group_to_subscribers(caption, raw_path, theme,
+                                                         prev_message_ids=state.message_ids)
+                else:
+                    log.info("📸 Group %d: %d new same-status city/cities → new message",
+                             state.group_id, len(new_same))
+                    new_ids = _send_group_to_subscribers(caption, raw_path, theme,
+                                                         prev_message_ids=None)
+
+                state.city_names = cluster_cities
+                state.last_broadcast_snapshot = new_snapshot
+                state.message_ids = new_ids
+                state.last_broadcast_time = now
+
+            else:
+                # No actionable change — update city_names in case cluster shape shifted
+                state.city_names = cluster_cities
+
+        # Process brand-new clusters
+        for cluster_cities in unmatched_new:
+            cluster_city_by_status = {c: city_by_status[c] for c in cluster_cities}
+            caption = _build_caption(alerts_data, city_filter=cluster_cities)
+            log.info("📸 New geographic group of %d city/cities → new message", len(cluster_cities))
+            new_ids = _send_group_to_subscribers(caption, raw_path, theme, prev_message_ids=None)
+
+            new_snapshot = {s: frozenset(cs) for s, cs in
+                            _group_cities_by_status(cluster_city_by_status).items()}
+            group_id = next(_group_id_counter)
+            active_groups[group_id] = GroupState(
+                group_id=group_id,
+                city_names=cluster_cities,
+                last_broadcast_snapshot=new_snapshot,
+                message_ids=new_ids,
+                last_broadcast_time=now,
+            )
+
+        # Remove orphaned states (alerts cleared for those areas)
+        for state in orphaned:
+            active_groups.pop(state.group_id, None)
+            log.info("📸 Removed orphaned group %d (alerts cleared)", state.group_id)
+
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+
+def _group_cities_by_status(city_by_status: dict[str, str]) -> dict[str, set[str]]:
+    """Helper: invert city->status to status->set[city]."""
+    result: dict[str, set[str]] = defaultdict(set)
+    for city, status in city_by_status.items():
+        result[status].add(city)
+    return dict(result)
+
+
 def main():
     log.info("=== ClearMap Screenshot Service starting ===")
 
@@ -774,8 +1235,9 @@ def main():
     previous_primary_pairs: set[tuple[str, str]] = set()
     latest_snapshot: dict = {}
     snapshot_lock = threading.Lock()
-    # For edit-in-place: maps chat_id → message_id of the last broadcast
-    last_message_ids: dict[str, int] = {}
+    # Per-geographic-group state: group_id -> GroupState
+    active_groups: dict[int, GroupState] = {}
+    centroids = _load_centroids()
 
     def on_alerts_change(event):
         """Firebase listener callback — fires on every change to active_alerts."""
@@ -798,8 +1260,8 @@ def main():
                 if isinstance(alert, dict):
                     status = alert.get("status", "")
                     if _is_primary_alert(status):
-                        # Skip test alerts
-                        if alert.get("is_test") or alert.get("test") or alert.get("isTest"):
+                        # Skip test alerts unless TEST_CHANNEL_ID is configured
+                        if not TEST_CHANNEL_ID and (alert.get("is_test") or alert.get("test") or alert.get("isTest")):
                             continue
                         current_primary_pairs.add((key, status))
 
@@ -821,8 +1283,10 @@ def main():
     # Start Telegram command listener
     threading.Thread(target=telegram_listener, daemon=True).start()
 
-    log.info("📸 Broadcast config: cooldown=%ds batch_delay=%ds edit_window=%ds",
-             SCREENSHOT_COOLDOWN, BATCH_DELAY, EDIT_WINDOW)
+    log.info("📸 Broadcast config: cooldown=%ds batch_delay=%ds edit_window=%ds cluster_km=%.0f",
+             SCREENSHOT_COOLDOWN, BATCH_DELAY, EDIT_WINDOW, GEO_CLUSTER_KM)
+    if TEST_CHANNEL_ID:
+        log.warning("⚠️  TEST MODE: routing all messages (incl. is_test alerts) to %s only", TEST_CHANNEL_ID)
 
     # Main loop — handles batching and cooldown
     while True:
@@ -832,17 +1296,21 @@ def main():
 
                 if now >= sliding_window_end:
                     time_since_last = now - last_screenshot_time
-                    # Allow through if cooldown elapsed OR if we can edit a recent message
-                    can_edit = (time_since_last < EDIT_WINDOW and bool(last_message_ids))
+                    # Allow through if cooldown elapsed OR if any group has a live editable message
+                    can_edit = any(gs.message_ids for gs in active_groups.values())
                     if time_since_last >= SCREENSHOT_COOLDOWN or can_edit:
                         with snapshot_lock:
                             current_data = dict(latest_snapshot)
 
                         if current_data:
                             # Filter out test alerts to see if there's anything real to show
+                            # (In test mode, treat is_test alerts as real)
                             real_alerts = {
                                 k: v for k, v in current_data.items()
-                                if isinstance(v, dict) and not (v.get("is_test") or v.get("test") or v.get("isTest"))
+                                if isinstance(v, dict) and (
+                                    TEST_CHANNEL_ID or
+                                    not (v.get("is_test") or v.get("test") or v.get("isTest"))
+                                )
                             }
 
                             if not real_alerts:
@@ -853,26 +1321,10 @@ def main():
                             # Clear the flag BEFORE the blocking broadcast so that any new
                             # alerts arriving during capture/send can re-arm it correctly.
                             pending_screenshot = False
-                            log.info("📸 Cooldown & batch window elapsed — capturing screenshot for %d alerts",
+                            log.info("📸 Cooldown & batch window elapsed — broadcasting for %d alerts",
                                      len(real_alerts))
                             try:
-                                caption = _build_caption(current_data)
-                                log.info("📸 Caption: %s", caption)
-
-                                # If within EDIT_WINDOW of last broadcast, edit
-                                # existing messages instead of sending new ones.
-                                time_since_last = now - last_screenshot_time
-                                edit_ids = last_message_ids if (
-                                    time_since_last < EDIT_WINDOW and last_message_ids
-                                ) else None
-
-                                if edit_ids:
-                                    log.info("📸 Within edit window (%.0fs < %ds) — editing existing messages",
-                                             time_since_last, EDIT_WINDOW)
-
-                                last_message_ids = broadcast_to_subscribers(
-                                    caption, prev_message_ids=edit_ids,
-                                )
+                                broadcast_all_groups(active_groups, current_data, centroids)
                                 last_screenshot_time = time.time()
                             except Exception as e:
                                 log.error("📸 Screenshot/broadcast failed: %s", e)
