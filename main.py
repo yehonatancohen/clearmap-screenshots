@@ -175,6 +175,10 @@ def capture_screenshot(url: str, output_path: Path, theme: str = "dark",
                 page.goto(screenshot_url, wait_until="load", timeout=45000)
                 page.wait_for_selector(".leaflet-container", timeout=15000)
 
+                # Broadcast mode has a 12s setTimeout before AlertFitter auto-fits
+                # the map to alert areas — wait for that before polling tiles.
+                time.sleep(13)
+
                 # Wait for Leaflet tile images to finish loading.
                 # Tiles are fetched asynchronously after page load, so a fixed
                 # sleep is unreliable. Poll until all visible tile <img> elements
