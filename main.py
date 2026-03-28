@@ -1078,6 +1078,79 @@ def _compute_group_diff(
     return new_same, dict(upgraded)
 
 
+# ── Ellipse Geometry Helpers ─────────────────────────────────────────────────
+
+def _pca_angle(points: list[tuple[float, float]]) -> float:
+    """
+    Returns the principal axis bearing (degrees, clockwise from north) for a
+    set of (lat, lon) points using 2×2 covariance PCA.  Returns 0.0 for ≤1 point.
+    """
+    if len(points) <= 1:
+        return 0.0
+    n = len(points)
+    mean_lat = sum(p[0] for p in points) / n
+    mean_lon = sum(p[1] for p in points) / n
+    centered = [(p[0] - mean_lat, p[1] - mean_lon) for p in points]
+    cov_ll = sum(c[0] * c[0] for c in centered) / n
+    cov_lo = sum(c[0] * c[1] for c in centered) / n
+    cov_oo = sum(c[1] * c[1] for c in centered) / n
+    # Angle of first eigenvector from standard x-axis
+    angle_rad = 0.5 * math.atan2(2.0 * cov_lo, cov_ll - cov_oo)
+    # Convert to compass bearing (north = 0, clockwise positive), mod 180
+    return (90.0 - math.degrees(angle_rad)) % 180.0
+
+
+def _extents_along_angle(
+    points: list[tuple[float, float]],
+    c_lat: float,
+    c_lon: float,
+    angle: float,
+) -> tuple[float, float]:
+    """
+    Project all points onto the principal axis (bearing degrees from north) and
+    its perpendicular.  Returns (semi_major_km, semi_minor_km), minimum 5 km each.
+    """
+    angle_rad = math.radians(angle)
+    cos_lat = math.cos(math.radians(c_lat))
+    proj_major: list[float] = []
+    proj_minor: list[float] = []
+    for p in points:
+        dlat_km = (p[0] - c_lat) * 111.0
+        dlon_km = (p[1] - c_lon) * 111.0 * cos_lat
+        proj_major.append(dlat_km * math.cos(angle_rad) + dlon_km * math.sin(angle_rad))
+        proj_minor.append(-dlat_km * math.sin(angle_rad) + dlon_km * math.cos(angle_rad))
+    semi_major = max(5.0, max(abs(v) for v in proj_major))
+    semi_minor = max(5.0, max(abs(v) for v in proj_minor))
+    return semi_major, semi_minor
+
+
+def _generate_ellipse_ring(
+    c_lat: float,
+    c_lon: float,
+    semi_major: float,
+    semi_minor: float,
+    angle: float,
+    n_points: int = 36,
+) -> list[tuple[float, float]]:
+    """
+    Return n_points (lat, lon) on an ellipse centred at (c_lat, c_lon),
+    semi axes in km, oriented at angle (bearing degrees from north).
+    """
+    angle_rad = math.radians(angle)
+    cos_lat = math.cos(math.radians(c_lat))
+    ring: list[tuple[float, float]] = []
+    for i in range(n_points):
+        theta = 2.0 * math.pi * i / n_points
+        x_maj = semi_major * math.cos(theta)
+        x_min = semi_minor * math.sin(theta)
+        dlat_km = x_maj * math.cos(angle_rad) - x_min * math.sin(angle_rad)
+        dlon_km = x_maj * math.sin(angle_rad) + x_min * math.cos(angle_rad)
+        dlat = dlat_km / 111.0
+        dlon = dlon_km / (111.0 * cos_lat) if cos_lat > 0.0 else 0.0
+        ring.append((c_lat + dlat, c_lon + dlon))
+    return ring
+
+
 # ── Per-Group Broadcast Helpers ──────────────────────────────────────────────
 
 def _compute_cluster_view(
