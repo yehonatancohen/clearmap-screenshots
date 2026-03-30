@@ -1201,20 +1201,20 @@ def _compute_cluster_view(
     # 4. Generate Ellipse Ring Points
     ring = _generate_ellipse_ring(c_lat, c_lon, semi_major, semi_minor, angle)
 
-    # 5. Compute View Bounds from Ring
-    rlats = [p[0] for p in ring]
-    rlons = [p[1] for p in ring]
+    # 5. Compute View Bounds from the union of ellipse ring + city centroids
+    #    This guarantees both the ellipse outline and all alert markers are visible.
+    bound_lats = [p[0] for p in ring] + [p[0] for p in known]
+    bound_lons = [p[1] for p in ring] + [p[1] for p in known]
 
-    # Recalculate center based on ring bounds for better alignment
-    center_lat = (min(rlats) + max(rlats)) / 2.0
-    center_lon = (min(rlons) + max(rlons)) / 2.0
+    center_lat = (min(bound_lats) + max(bound_lats)) / 2.0
+    center_lon = (min(bound_lons) + max(bound_lons)) / 2.0
 
-    lat_span_km = (max(rlats) - min(rlats)) * 111.0
-    lon_span_km = (max(rlons) - min(rlons)) * 111.0 * math.cos(math.radians(center_lat))
+    lat_span_km = (max(bound_lats) - min(bound_lats)) * 111.0
+    lon_span_km = (max(bound_lons) - min(bound_lons)) * 111.0 * math.cos(math.radians(center_lat))
     max_span_km = max(lat_span_km, lon_span_km, 1.0)
 
-    # Use 40% padding — enough margin so the ellipse edges are not cut off
-    padded_km = max_span_km * 1.4
+    # 30% padding — keeps the ellipse + markers comfortably in frame without over-zooming out
+    padded_km = max_span_km * 1.3
     zoom = max(7, min(13, round(8.3 + math.log2(400.0 / padded_km))))
 
     return center_lat, center_lon, zoom
