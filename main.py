@@ -1156,19 +1156,33 @@ def _generate_ellipse_ring(
 def _compute_cluster_view(
     city_names: set[str],
     centroids: dict[str, tuple[float, float]],
+    city_statuses: dict[str, str] | None = None,
 ) -> tuple[float | None, float | None, int | None]:
     """
     Compute the best map center (lat, lon) and zoom level for a geographic cluster.
     Centers on the calculated impact ellipse ring to ensure it fits perfectly.
+
+    If city_statuses is provided and contains non-pre_alert cities, the ellipse
+    is computed from those alert cities only (ignoring pre_alerts for centering).
     """
-    known = [centroids[c] for c in city_names if c in centroids]
+    # Prefer alert/uav/terrorist cities for ellipse focus; fall back to all cities
+    if city_statuses:
+        alert_cities = {c for c in city_names
+                        if city_statuses.get(c, "pre_alert") != "pre_alert"}
+    else:
+        alert_cities = set()
+    focus_cities = alert_cities if alert_cities else city_names
+
+    known = [centroids[c] for c in focus_cities if c in centroids]
+    if not known:
+        known = [centroids[c] for c in city_names if c in centroids]
     if not known:
         return None, None, None
 
     # Load polygon points for fitting the ellipse
     polygon_points = _load_polygon_points()
     all_points: list[tuple[float, float]] = []
-    for c in city_names:
+    for c in focus_cities:
         pts = polygon_points.get(c)
         if pts:
             all_points.extend(pts)
@@ -1190,7 +1204,7 @@ def _compute_cluster_view(
     # 5. Compute View Bounds from Ring
     rlats = [p[0] for p in ring]
     rlons = [p[1] for p in ring]
-    
+
     # Recalculate center based on ring bounds for better alignment
     center_lat = (min(rlats) + max(rlats)) / 2.0
     center_lon = (min(rlons) + max(rlons)) / 2.0
@@ -1199,8 +1213,8 @@ def _compute_cluster_view(
     lon_span_km = (max(rlons) - min(rlons)) * 111.0 * math.cos(math.radians(center_lat))
     max_span_km = max(lat_span_km, lon_span_km, 1.0)
 
-    # Use 60% padding to ensure the ellipse ring + shadows are fully visible
-    padded_km = max_span_km * 1.6
+    # Use 20% padding — tighter crop so the ellipse fills the frame
+    padded_km = max_span_km * 1.2
     zoom = max(7, min(13, round(8.3 + math.log2(400.0 / padded_km))))
 
     return center_lat, center_lon, zoom
@@ -1412,7 +1426,7 @@ def broadcast_all_groups(
 
         do_edit = bool(state.message_ids) and not status_escalated
 
-        lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+        lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids, cluster_city_by_status)
         caption = _build_caption(alerts_data, city_filter=cluster_cities)
         raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
         if raw_path:
@@ -1437,7 +1451,8 @@ def broadcast_all_groups(
     # Process brand-new clusters
     for cluster_cities in unmatched_new:
         caption = _build_caption(alerts_data, city_filter=cluster_cities)
-        lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids)
+        cluster_city_by_status_new = {c: city_by_status[c] for c in cluster_cities}
+        lat, lon, zoom = _compute_cluster_view(cluster_cities, centroids, cluster_city_by_status_new)
         log.info("📸 New group (%s) of %d cities → new message", "TEST" if is_test_run else "REAL", len(cluster_cities))
         raw_path = _capture_raw_screenshot(theme, lat, lon, zoom)
         if raw_path:
