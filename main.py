@@ -1213,8 +1213,8 @@ def _compute_cluster_view(
     lon_span_km = (max(rlons) - min(rlons)) * 111.0 * math.cos(math.radians(center_lat))
     max_span_km = max(lat_span_km, lon_span_km, 1.0)
 
-    # Use 20% padding — tighter crop so the ellipse fills the frame
-    padded_km = max_span_km * 1.2
+    # Use 40% padding — enough margin so the ellipse edges are not cut off
+    padded_km = max_span_km * 1.4
     zoom = max(7, min(13, round(8.3 + math.log2(400.0 / padded_km))))
 
     return center_lat, center_lon, zoom
