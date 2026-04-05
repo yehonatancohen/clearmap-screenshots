@@ -182,6 +182,52 @@ def draw_legend(img: Image.Image, active_statuses: set[str], theme: str,
     return img
 
 
+def draw_url_badge(img: Image.Image, theme: str) -> Image.Image:
+    """Draw a clearmap.co.il pill badge in the bottom-right corner."""
+    img = img.copy().convert("RGBA")
+    w, h = img.size
+
+    text = "clearmap.co.il"
+    font_size = max(18, int(w * 0.026))
+    font = _load_hebrew_font(font_size)
+
+    dummy_draw = ImageDraw.Draw(img)
+    bbox = dummy_draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    pad_x = int(w * 0.018)
+    pad_y = int(w * 0.010)
+    badge_w = text_w + pad_x * 2
+    badge_h = text_h + pad_y * 2
+    margin = int(w * 0.025)
+    bx = w - badge_w - margin
+    by = h - badge_h - margin
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+
+    bg_alpha = 50 if theme == "dark" else 40
+    border_alpha = 80 if theme == "dark" else 60
+    bg_color = (255, 255, 255, bg_alpha) if theme == "dark" else (0, 0, 0, bg_alpha)
+    overlay_draw.rounded_rectangle(
+        [bx, by, bx + badge_w, by + badge_h],
+        radius=badge_h // 2,
+        fill=bg_color,
+        outline=(*((255, 255, 255) if theme == "dark" else (0, 0, 0)), border_alpha),
+        width=2,
+    )
+    img = Image.alpha_composite(img, overlay)
+    draw = ImageDraw.Draw(img)
+
+    text_color = (255, 255, 255, 220) if theme == "dark" else (10, 10, 20, 200)
+    tx = bx + pad_x
+    ty = by + pad_y - bbox[1]  # compensate for ascent offset
+    draw.text((tx, ty), text, fill=text_color, font=font)
+
+    return img
+
+
 def draw_uav_disclaimer(img: Image.Image, theme: str) -> Image.Image:
     """Draw a disclaimer centered at the top about UAV predictions."""
     w, h = img.size
@@ -288,6 +334,9 @@ def overlay_screenshot(raw_path: Path, output_path: Path, size: int = 1080,
         img = draw_legend(img, active_statuses, theme, counts=status_counts)
         if "uav" in active_statuses:
             img = draw_uav_disclaimer(img, theme)
+
+    # URL badge
+    img = draw_url_badge(img, theme)
 
     # Save
     img = img.convert("RGB")
