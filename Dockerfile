@@ -30,6 +30,9 @@ VOLUME ["/app/public"]
 
 ENV PYTHONUNBUFFERED=1
 
+# On-demand share-screenshot endpoint (see run_share_server in main.py)
+EXPOSE 8787
+
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 

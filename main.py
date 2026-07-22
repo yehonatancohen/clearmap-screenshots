@@ -69,6 +69,15 @@ BATCH_DELAY = int(os.environ.get("SCREENSHOT_BATCH_DELAY", "") or _cfg.get("SCRE
 # edit the existing Telegram message instead of sending a new one.
 EDIT_WINDOW = int(os.environ.get("SCREENSHOT_EDIT_WINDOW", "") or _cfg.get("SCREENSHOT_EDIT_WINDOW", "300"))
 GEO_CLUSTER_KM = float(os.environ.get("GEO_CLUSTER_KM", "") or _cfg.get("GEO_CLUSTER_KM", "30"))
+# On-demand share endpoint (used by the in-app Share button)
+SHARE_SERVER_PORT = int(os.environ.get("SHARE_SERVER_PORT", "") or _cfg.get("SHARE_SERVER_PORT", "8787"))
+SHARE_ALLOWED_ORIGINS = {
+    o.strip() for o in (
+        os.environ.get("SHARE_ALLOWED_ORIGINS", "") or _cfg.get(
+            "SHARE_ALLOWED_ORIGINS", "https://clearmap.co.il,https://www.clearmap.co.il,http://localhost:3000"
+        )
+    ).split(",") if o.strip()
+}
 POLYGONS_FILE_DEFAULT = Path(__file__).parent / "polygons.json"
 FIREBASE_DB_URL = "https://clear-map-f20d0-default-rtdb.europe-west1.firebasedatabase.app/"
 FIREBASE_NODE = "/public_state/active_alerts"
@@ -130,116 +139,136 @@ def init_firebase():
 
 # ── Screenshot Capture ──────────────────────────────────────────────────────
 
+# Serializes every Chromium capture — broadcast batches AND on-demand share
+# requests alike — so we never run two headless browsers at once. Chromium
+# needs ~200-500MB per instance (see README), which is why this service runs
+# on its own machine in the first place; letting captures overlap risks OOM.
+chromium_lock = threading.Lock()
+
+
 def capture_screenshot(url: str, output_path: Path, theme: str = "dark",
                        size: int = 1080, custom_logo_path: Path | None = None,
-                       init_script: str | None = None) -> tuple[Path, Path]:
+                       init_script: str | None = None, fit_wait_secs: float = 13) -> tuple[Path, Path]:
     """
     Capture a screenshot of the map using Playwright, overlay logo + legend.
     Returns (final_output_path, raw_capture_path).
+
+    fit_wait_secs: how long to wait for AlertFitter's broadcast-mode auto-fit
+    before polling tiles. Callers that pass explicit lat/lon/zoom (which makes
+    AlertFitter skip auto-fit entirely, see MapView.tsx) can pass a much
+    shorter value here.
     """
     from playwright.sync_api import sync_playwright
     from screenshot_overlay import overlay_screenshot
 
-    chromium_args = [
-        "--disable-dev-shm-usage",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--disable-extensions",
-        "--mute-audio",
-        "--disable-background-networking",
-        "--disable-site-isolation-trials",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--js-flags=--max-old-space-size=512",
-    ]
+    if not chromium_lock.acquire(timeout=25):
+        raise RuntimeError("Screenshot service is busy — try again shortly")
 
-    screenshot_url = f"{url}?screenshot=true" if "?" not in url else f"{url}&screenshot=true"
+    try:
+        chromium_args = [
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-extensions",
+            "--mute-audio",
+            "--disable-background-networking",
+            "--disable-site-isolation-trials",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
+            "--js-flags=--max-old-space-size=512",
+        ]
 
-    MAX_RETRIES = 3
-    for attempt in range(1, MAX_RETRIES + 1):
-        browser = None
-        try:
-            log.info("📸 Attempt %d/%d — launching browser...", attempt, MAX_RETRIES)
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=chromium_args)
-                context = browser.new_context(
-                    viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
-                    device_scale_factor=1.5,
-                )
-                if init_script:
-                    context.add_init_script(init_script)
-                page = context.new_page()
+        screenshot_url = f"{url}?screenshot=true" if "?" not in url else f"{url}&screenshot=true"
 
-                page.goto(screenshot_url, wait_until="load", timeout=45000)
-                page.wait_for_selector(".leaflet-container", timeout=15000)
-
-                # Broadcast mode has a 12s setTimeout before AlertFitter auto-fits
-                # the map to alert areas — wait for that before polling tiles.
-                time.sleep(13)
-
-                # Wait for Leaflet tile images to finish loading.
-                # Tiles are fetched asynchronously after page load, so a fixed
-                # sleep is unreliable. Poll until all visible tile <img> elements
-                # report complete=true, with a 12s timeout before giving up.
-                try:
-                    page.wait_for_function(
-                        """() => {
-                            const tiles = document.querySelectorAll('img.leaflet-tile');
-                            return tiles.length > 0 &&
-                                   Array.from(tiles).every(t => t.complete && t.naturalWidth > 0);
-                        }""",
-                        timeout=12000,
+        MAX_RETRIES = 3
+        for attempt in range(1, MAX_RETRIES + 1):
+            browser = None
+            try:
+                log.info("📸 Attempt %d/%d — launching browser...", attempt, MAX_RETRIES)
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True, args=chromium_args)
+                    context = browser.new_context(
+                        viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
+                        device_scale_factor=1.5,
                     )
-                except Exception:
-                    log.warning("📸 Tile load wait timed out — taking screenshot anyway")
-                time.sleep(0.5)  # Brief pause for final paint
+                    if init_script:
+                        context.add_init_script(init_script)
+                    page = context.new_page()
 
-                # Hide UI overlays — keep only map + polygons
-                page.evaluate("""
-                    const style = document.createElement('style');
-                    style.textContent = `
-                        .glass-overlay,
-                        [class*="absolute top-3"],
-                        [class*="absolute bottom-4"],
-                        [class*="absolute top-14"],
-                        [class*="absolute top-16"],
-                        [class*="absolute bottom-16"],
-                        [class*="z-[1000]"],
-                        [class*="z-[1001]"],
-                        [class*="z-[1002]"],
-                        [class*="z-[2000]"] {
-                            display: none !important;
-                        }
-                        .leaflet-control-container {
-                            display: none !important;
-                        }
-                    `;
-                    document.head.appendChild(style);
-                """)
-                time.sleep(0.5)
+                    page.goto(screenshot_url, wait_until="load", timeout=45000)
+                    page.wait_for_selector(".leaflet-container", timeout=15000)
 
-                raw_path = output_path.parent / f"raw_capture_{int(time.time())}.png"
-                page.screenshot(path=str(raw_path), full_page=False)
-                browser.close()
+                    # Broadcast mode has a 12s setTimeout before AlertFitter auto-fits
+                    # the map to alert areas — wait for that before polling tiles.
+                    # Callers passing explicit lat/lon/zoom skip auto-fit entirely
+                    # (see MapView.tsx AlertFitter) and can shorten this wait.
+                    time.sleep(fit_wait_secs)
 
-            log.info("📸 Raw screenshot captured: %s", raw_path.name)
-            return raw_path
+                    # Wait for Leaflet tile images to finish loading.
+                    # Tiles are fetched asynchronously after page load, so a fixed
+                    # sleep is unreliable. Poll until all visible tile <img> elements
+                    # report complete=true, with a 12s timeout before giving up.
+                    try:
+                        page.wait_for_function(
+                            """() => {
+                                const tiles = document.querySelectorAll('img.leaflet-tile');
+                                return tiles.length > 0 &&
+                                       Array.from(tiles).every(t => t.complete && t.naturalWidth > 0);
+                            }""",
+                            timeout=12000,
+                        )
+                    except Exception:
+                        log.warning("📸 Tile load wait timed out — taking screenshot anyway")
+                    time.sleep(0.5)  # Brief pause for final paint
 
-        except Exception as e:
-            log.error("📸 Attempt %d failed: %s", attempt, e)
-            if browser:
-                try:
+                    # Hide UI overlays — keep only map + polygons
+                    page.evaluate("""
+                        const style = document.createElement('style');
+                        style.textContent = `
+                            .glass-overlay,
+                            [class*="absolute top-3"],
+                            [class*="absolute bottom-4"],
+                            [class*="absolute top-14"],
+                            [class*="absolute top-16"],
+                            [class*="absolute bottom-16"],
+                            [class*="z-[1000]"],
+                            [class*="z-[1001]"],
+                            [class*="z-[1002]"],
+                            [class*="z-[2000]"] {
+                                display: none !important;
+                            }
+                            .leaflet-control-container {
+                                display: none !important;
+                            }
+                        `;
+                        document.head.appendChild(style);
+                    """)
+                    time.sleep(0.5)
+
+                    raw_path = output_path.parent / f"raw_capture_{int(time.time())}.png"
+                    page.screenshot(path=str(raw_path), full_page=False)
                     browser.close()
-                except Exception:
-                    pass
-            if attempt < MAX_RETRIES:
-                wait_secs = attempt * 3
-                log.info("📸 Retrying in %ds...", wait_secs)
-                time.sleep(wait_secs)
-            else:
-                raise RuntimeError(f"All {MAX_RETRIES} screenshot attempts failed") from e
+
+                log.info("📸 Raw screenshot captured: %s", raw_path.name)
+                return raw_path
+
+            except Exception as e:
+                log.error("📸 Attempt %d failed: %s", attempt, e)
+                if browser:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                if attempt < MAX_RETRIES:
+                    wait_secs = attempt * 3
+                    log.info("📸 Retrying in %ds...", wait_secs)
+                    time.sleep(wait_secs)
+                else:
+                    raise RuntimeError(f"All {MAX_RETRIES} screenshot attempts failed") from e
+    finally:
+        chromium_lock.release()
 
 
 
@@ -1485,6 +1514,105 @@ def _group_cities_by_status(city_by_status: dict[str, str]) -> dict[str, set[str
     return dict(result)
 
 
+# ── On-demand Share Server ───────────────────────────────────────────────────
+# Powers the in-app "Share" button: the user's current map center/zoom is
+# sent here, we render exactly that view through the same Playwright +
+# Pillow pipeline used for Telegram broadcasts, and hand back the PNG —
+# so the shared image is pixel-identical to what the channel receives.
+
+_share_ip_last_request: dict[str, float] = {}
+_share_ip_lock = threading.Lock()
+SHARE_PER_IP_COOLDOWN_SECS = 15
+
+
+def _share_rate_limit_ok(ip: str) -> bool:
+    now = time.time()
+    with _share_ip_lock:
+        last = _share_ip_last_request.get(ip, 0.0)
+        if now - last < SHARE_PER_IP_COOLDOWN_SECS:
+            return False
+        _share_ip_last_request[ip] = now
+        return True
+
+
+def _build_share_app():
+    """Builds (but does not run) the Flask app for the share endpoint."""
+    from flask import Flask, request, jsonify, send_file
+
+    app = Flask(__name__)
+
+    @app.after_request
+    def _add_cors(resp):
+        origin = request.headers.get("Origin", "")
+        if origin in SHARE_ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return resp
+
+    @app.route("/api/share-screenshot", methods=["OPTIONS"])
+    def _share_preflight():
+        return "", 204
+
+    @app.route("/api/share-screenshot", methods=["POST"])
+    def share_screenshot():
+        from screenshot_overlay import overlay_screenshot
+
+        data = request.get_json(silent=True) or {}
+
+        try:
+            lat = float(data.get("lat"))
+            lon = float(data.get("lon"))
+            zoom = float(data.get("zoom"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "lat, lon and zoom are required numbers"}), 400
+
+        theme = data.get("theme") if data.get("theme") in ("dark", "light") else "dark"
+
+        # Sanity-bound inputs — this renders Israel's alert map, not an arbitrary URL.
+        if not (28.0 <= lat <= 34.0) or not (33.0 <= lon <= 37.0):
+            return jsonify({"error": "coordinates out of range"}), 400
+        zoom = max(5, min(16, zoom))
+
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+        if not _share_rate_limit_ok(ip):
+            return jsonify({"error": "too many requests, try again shortly"}), 429
+
+        base = SCREENSHOT_URL.split("?")[0]
+        url = f"{base}?uav=true&ellipse=true&theme={theme}&lat={lat:.5f}&lon={lon:.5f}&zoom={zoom:.2f}"
+
+        final_path = None
+        raw_path = None
+        try:
+            dummy_path = OUTPUT_DIR / f"share_{int(time.time() * 1000)}.png"
+            # lat/lon/zoom make AlertFitter skip its auto-fit, so we don't
+            # need the long broadcast-mode settle delay.
+            raw_path = capture_screenshot(url, dummy_path, theme=theme, fit_wait_secs=1.5)
+            final_path = OUTPUT_DIR / f"share_final_{int(time.time() * 1000)}.png"
+            overlay_screenshot(raw_path, final_path, theme=theme)
+            return send_file(str(final_path), mimetype="image/png")
+        except Exception as e:
+            log.error("📸 Share screenshot failed: %s", e)
+            return jsonify({"error": str(e)}), 500
+        finally:
+            for p in (raw_path, final_path):
+                if p:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+    return app
+
+
+def run_share_server():
+    """Runs the share endpoint in the calling thread. Call via a daemon thread."""
+    from waitress import serve
+    app = _build_share_app()
+    log.info("🔗 Share endpoint listening on :%d (origins: %s)", SHARE_SERVER_PORT, ", ".join(SHARE_ALLOWED_ORIGINS))
+    serve(app, host="0.0.0.0", port=SHARE_SERVER_PORT)
+
+
 def main():
     log.info("=== ClearMap Screenshot Service starting ===")
 
@@ -1565,6 +1693,7 @@ def main():
 
     # Start Telegram command listener
     threading.Thread(target=telegram_listener, daemon=True).start()
+    threading.Thread(target=run_share_server, daemon=True).start()
 
     log.info("📸 Broadcast config: cooldown=%ds batch_delay=%ds edit_window=%ds cluster_km=%.0f",
              SCREENSHOT_COOLDOWN, BATCH_DELAY, EDIT_WINDOW, GEO_CLUSTER_KM)
